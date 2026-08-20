@@ -1,0 +1,21 @@
+# Credentials — never commit these.
+.env
+*.session
+*.session-journal
+
+# Local state and output
+config.json
+downloader.log*
+telegram_downloads/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Editors / OS
+.idea/
+.DS_Store
