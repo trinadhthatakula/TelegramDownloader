@@ -10,12 +10,11 @@ Close the GUI app first. Both share one SQLite session file, and two clients
 writing it at once can corrupt it.
 """
 import asyncio
-import os
 import sys
 
 from telethon import TelegramClient, errors
 
-from interactive_downloader import BASE_DIR, ChatEntry, load_credentials
+from interactive_downloader import ChatEntry, load_account_store
 
 
 async def walk(client, archived, into, label):
@@ -40,9 +39,12 @@ async def walk(client, archived, into, label):
 
 
 async def main():
-    api_id, api_hash = load_credentials()
-    session = os.path.join(BASE_DIR, os.environ.get("TG_SESSION_NAME", "downloader_session"))
-    client = TelegramClient(session, api_id, api_hash)
+    accounts = load_account_store()
+    profile = accounts.data["profiles"].get(accounts.data["active"])
+    if not profile:
+        print("No active account. Sign in from the app's Accounts page first.")
+        return 1
+    client = TelegramClient(profile["session"], profile["api_id"], profile["api_hash"])
     await client.connect()
     try:
         if not await client.is_user_authorized():

@@ -16,6 +16,7 @@ import customtkinter as ctk
 from tkinter import filedialog, messagebox
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors
+from telegram_auth import AccountStore, AccountPage, AuthenticationMixin, validate_credentials
 
 # All app-owned paths resolve against the script directory, never the working
 # directory: launching from elsewhere used to scatter config.json / downloader.log
@@ -308,11 +309,14 @@ class QueueStats:
     total_bytes: int = 0
 
 
-class TelegramBackend:
-    def __init__(self, api_id: int, api_hash: str, session_path: str):
+class TelegramBackend(AuthenticationMixin):
+    def __init__(self, api_id: int, api_hash: str, session_path: str, accounts=None):
         self.api_id = api_id
         self.api_hash = api_hash
         self.session_path = session_path
+        self.configure_auth(accounts)
+        self._account_resetting = False
+        self._account_generation = 0
 
         self.event_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
         self.config = load_config()
@@ -360,7 +364,15 @@ class TelegramBackend:
                          exc or context.get("message"), exc_info=exc)
 
         self.loop.set_exception_handler(handle_async_exception)
-        self.loop.run_forever()
+        try:
+            self.loop.run_forever()
+        finally:
+            pending = asyncio.all_tasks(self.loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self.loop.close()
 
     def _spawn(self, coro, owner: Optional[DownloadItem] = None):
         """Schedules a coroutine as a real asyncio.Task on the loop thread.
@@ -370,8 +382,10 @@ class TelegramBackend:
         CancelledError inside the worker. Strong refs are held so in-flight
         tasks cannot be garbage collected.
         """
+        generation = self._account_generation
+
         def _create():
-            if self._shutting_down:
+            if self._shutting_down or self._account_resetting or generation != self._account_generation:
                 coro.close()
                 return
             task = asyncio.ensure_future(coro)
@@ -398,7 +412,51 @@ class TelegramBackend:
             return False
 
     def run_coro(self, coro):
-        return asyncio.run_coroutine_threadsafe(coro, self.loop)
+        generation = self._account_generation
+
+        async def tracked():
+            if generation != self._account_generation:
+                coro.close()
+                return
+            task = asyncio.current_task()
+            self._pending_tasks.add(task)
+            try:
+                return await coro
+            finally:
+                self._pending_tasks.discard(task)
+        return asyncio.run_coroutine_threadsafe(tracked(), self.loop)
+
+    async def _reset_account_work(self):
+        """Drain old work before replacing a client; never mix account entities."""
+        self._account_resetting = True
+        self.authorized = False
+        self._account_generation += 1
+        try:
+            self.cancel_all(exclude_task=asyncio.current_task())
+            pending = [t for t in self._pending_tasks if t is not asyncio.current_task()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            with self.queue_lock:
+                self.download_queue.clear()
+                self.queue_index.clear()
+            with self.states_lock:
+                self.pagination_states.clear()
+            self.chosen_exts.clear()
+            self.all_formats_mode = False
+            self.last_dispatched_chat_id = None
+            self.flood_until = 0
+            self._flood_timer_armed = False
+            # All producers belonging to the old account have now finished.
+            while True:
+                try:
+                    self.event_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.emit_event("account_reset")
+        finally:
+            self._account_resetting = False
 
     def snapshot_states(self) -> List[ChatSnapshot]:
         """Copies chat progress under lock.
@@ -449,29 +507,6 @@ class TelegramBackend:
 
     # ------------------------------------------------------------------ client
 
-    async def init_client(self):
-        """Connects the Telethon client and reports authorization state."""
-        try:
-            logger.info("Connecting Telegram client...")
-            self.client = TelegramClient(self.session_path, self.api_id, self.api_hash)
-            await self.client.connect()
-        except Exception as e:
-            # A network/DNS/proxy failure is not an auth problem; reporting it as
-            # one sent users hunting for a login flow that does not exist.
-            logger.exception("Could not connect to Telegram: %s", e)
-            self.emit_event("connect_failed", str(e))
-            return
-
-        try:
-            is_auth = await self.client.is_user_authorized()
-        except Exception as e:
-            logger.exception("Authorization check failed: %s", e)
-            self.emit_event("connect_failed", str(e))
-            return
-
-        logger.info("Telegram client connected. Authorized: %s", is_auth)
-        self.emit_event("auth_status", is_auth)
-
     async def fetch_dialogs(self):
         """Enumerates every chat, channel and group the account can see.
 
@@ -486,12 +521,18 @@ class TelegramBackend:
           a single wrapping ``except`` around one big call turns that into an
           empty chat list, which is exactly the "not all groups load" symptom.
         """
+        if self.accounts and not self.authorized:
+            return
+
         collected: Dict[int, Any] = {}
         failures: List[str] = []
 
         for label, archived in (("main", False), ("archive", True)):
             try:
                 await self._collect_dialogs(collected, archived, label)
+            except (errors.UnauthorizedError, errors.AuthKeyError):
+                await self.session_invalid()
+                return
             except Exception as e:
                 logger.exception("Dialog enumeration failed for the %s folder: %s", label, e)
                 failures.append(f"{label} folder: {e}")
@@ -545,6 +586,9 @@ class TelegramBackend:
 
     async def scan_extensions(self, selected_dialogs: "List[ChatEntry]"):
         """Scans recent history across selected chats to discover media extensions."""
+        if self.accounts and not self.authorized:
+            return
+
         discovered: Set[str] = set()
         try:
             scan_limit = self.config.get("scan_depth", 500)
@@ -557,6 +601,9 @@ class TelegramBackend:
                     async for msg in self.client.iter_messages(d.entity, limit=limit_val):
                         if msg.file and msg.file.ext:
                             discovered.add(msg.file.ext.lower())
+                except (errors.UnauthorizedError, errors.AuthKeyError):
+                    await self.session_invalid()
+                    return
                 except errors.FloodError as e:
                     wait = getattr(e, "seconds", 0) or 0
                     logger.warning("Rate limited while scanning '%s': waiting %ss", d.name, wait)
@@ -578,6 +625,9 @@ class TelegramBackend:
     async def enqueue_selected_chats(self, selected_dialogs: "List[ChatEntry]", chosen_exts: set,
                                      all_formats: bool = False):
         """Prepares per-chat state and kicks off the first batch fetch for each."""
+        if self.accounts and not self.authorized:
+            return
+
         self.chosen_exts = set(chosen_exts)
         self.all_formats_mode = all_formats or ("*" in chosen_exts) or (len(chosen_exts) == 0)
 
@@ -679,6 +729,8 @@ class TelegramBackend:
 
         except asyncio.CancelledError:
             raise
+        except (errors.UnauthorizedError, errors.AuthKeyError):
+            await self.session_invalid()
         except errors.FloodError as e:
             failed = True
             wait = getattr(e, "seconds", 0) or 0
@@ -722,9 +774,11 @@ class TelegramBackend:
 
         logger.info("Retrying '%s' in %ss (attempt %d).", name, delay, attempt)
 
+        generation = self._account_generation
         self._call_on_loop(
             lambda: self.loop.call_later(
-                delay, lambda: self._spawn(self._fetch_next_chat_batch(chat_id)))
+                delay, lambda: self._spawn(self._fetch_next_chat_batch(chat_id))
+                if generation == self._account_generation else None)
         )
 
     def _check_and_trigger_next_batch(self, chat_id: int):
@@ -767,7 +821,11 @@ class TelegramBackend:
         self._flood_timer_armed = True
         delay = max(0.5, self.flood_until - time.monotonic() + 0.5)
 
+        generation = self._account_generation
+
         def _clear():
+            if generation != self._account_generation:
+                return
             self._flood_timer_armed = False
             if time.monotonic() >= self.flood_until:
                 logger.info("Rate limit expired; resuming downloads.")
@@ -782,7 +840,7 @@ class TelegramBackend:
     def _schedule_downloads(self):
         """Dispatches queued items using fair round-robin across active chats."""
         try:
-            if self._shutting_down:
+            if self._shutting_down or self._account_resetting:
                 return
             if time.monotonic() < self.flood_until:
                 self._arm_flood_timer()
@@ -937,6 +995,10 @@ class TelegramBackend:
                 item.status = "Queued"
             else:
                 item.status = "Failed (stale reference)"
+        except (errors.UnauthorizedError, errors.AuthKeyError):
+            self._discard_temp(temp_path)
+            item.status = "Cancelled"
+            await self.session_invalid()
         except (errors.RPCError, OSError, IOError) as e:
             self._discard_temp(temp_path)
             logger.warning("Download of '%s' failed: %s", item.file_name, e)
@@ -1082,13 +1144,13 @@ class TelegramBackend:
         self.emit_event("item_updated", item)
         self._schedule_downloads()
 
-    def cancel_all(self):
+    def cancel_all(self, exclude_task=None):
         """Cancels everything still pending or in flight."""
         tasks = []
         with self.queue_lock:
             for item in self.download_queue:
                 if item.status in ("Queued", "Downloading"):
-                    if item.task is not None:
+                    if item.task is not None and item.task is not exclude_task:
                         tasks.append(item.task)
                     item.status = "Cancelled"
         with self.states_lock:
@@ -1166,39 +1228,27 @@ class TelegramBackend:
         return count, total
 
     def shutdown(self, timeout: float = 5.0):
-        """Cancels in-flight work, disconnects the client and stops the loop."""
+        """Cancel authentication and downloads before disconnecting and closing."""
         if self._shutting_down:
             return
         self._shutting_down = True
-        logger.info("Shutting down...")
 
-        with self.queue_lock:
-            tasks = [it.task for it in self.download_queue if it.task is not None]
-        for task in tasks:
-            try:
-                self.loop.call_soon_threadsafe(task.cancel)
-            except RuntimeError:
-                pass
-        if tasks:
-            # Let the cancelled workers run their finally blocks so partial
-            # .part files are removed before the loop goes away.
-            deadline = time.monotonic() + min(2.0, timeout)
-            while time.monotonic() < deadline and any(not t.done() for t in tasks):
-                time.sleep(0.05)
-
-        if self.client is not None:
-            try:
-                fut = asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
-                fut.result(timeout=timeout)
-            except Exception as e:
-                logger.warning("Client disconnect did not complete cleanly: %s", e)
+        async def drain():
+            pending = list(self._pending_tasks)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if self.client is not None:
+                await self.client.disconnect()
 
         try:
+            asyncio.run_coroutine_threadsafe(drain(), self.loop).result(timeout=timeout)
+        except Exception as exc:
+            logger.warning("Shutdown did not complete cleanly: %s", type(exc).__name__)
+        finally:
             self.loop.call_soon_threadsafe(self.loop.stop)
             self.thread.join(timeout=timeout)
-        except RuntimeError:
-            pass
-        logger.info("Shutdown complete.")
 
 
 # Number of reusable row widgets kept alive in the queue view. Rendering cost is
@@ -1249,6 +1299,8 @@ class App(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self._poll_queue()
         self._tick_refresh()
+        self.page_accounts.busy = self.backend.accounts is not None
+        self.page_accounts.update_buttons()
         self.backend.run_coro(self.backend.init_client())
         self.after(1200, self._offer_orphan_cleanup)
 
@@ -1303,25 +1355,36 @@ class App(ctk.CTk):
             self.after(400, self._tick_refresh)
 
     def _process_ui_update(self, event_type: str, data: Any):
-        if event_type == "auth_status":
+        if event_type == "login_state":
+            self.page_accounts.handle(data)
+            self.set_status(data["message"])
+            if data["stage"] != "authorized":
+                self.select_page("accounts")
+        elif event_type == "login_finished":
+            self.page_accounts.finished()
+        elif event_type == "account_profile":
+            self.page_accounts.show_profile(data)
+        elif event_type == "account_reset":
+            self.page_accounts.reset_profile()
+            self.all_chats.clear()
+            self.filtered_chats.clear()
+            self.selected_chat_ids.clear()
+            self.active_group_filter = None
+            self.chat_offset = self.queue_offset = 0
+            self._flood_notice = ""
+            self.on_filter_chats()
+            self.populate_scanned_extensions()
+            self._queue_dirty = self._sidebar_dirty = True
+        elif event_type == "auth_status":
             if data:
                 self.set_status("Connected. Loading your chats...")
                 self.backend.run_coro(self.backend.fetch_dialogs())
             else:
-                self.set_status("Not signed in. Run a Telethon login for this session file first.")
-                messagebox.showwarning(
-                    "Not signed in",
-                    "This session is not authorized.\n\n"
-                    "Sign in once from a terminal, then reopen the app:\n\n"
-                    "  python -c \"from telethon import TelegramClient; import os;"
-                    " TelegramClient(os.path.abspath('downloader_session'),"
-                    " int(os.environ['TG_API_ID']), os.environ['TG_API_HASH']).start()\"",
-                )
+                self.select_page("accounts")
         elif event_type == "connect_failed":
             self.set_status(f"Could not reach Telegram: {data}")
-            messagebox.showerror("Connection failed",
-                                 f"Could not reach Telegram:\n\n{data}\n\n"
-                                 "Check your network and reopen the app.")
+            self.page_accounts.status.configure(text="Connection failed. Check your network and reconnect here.")
+            self.select_page("accounts")
         elif event_type == "dialogs_progress":
             if isinstance(data, str):
                 self.set_status(data)
@@ -1369,7 +1432,7 @@ class App(ctk.CTk):
 
         self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
         self.sidebar_frame.grid(row=0, column=0, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(4, weight=1)
+        self.sidebar_frame.grid_rowconfigure(5, weight=1)
 
         self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="Telegram Downloader",
                                        font=ctk.CTkFont(size=16, weight="bold"))
@@ -1392,6 +1455,12 @@ class App(ctk.CTk):
             command=lambda: self.select_page("settings")
         )
         self.btn_nav_settings.grid(row=3, column=0, padx=10, pady=5, sticky="ew")
+
+        self.btn_nav_accounts = ctk.CTkButton(
+            self.sidebar_frame, text="Accounts", anchor="w",
+            command=lambda: self.select_page("accounts"))
+        self.btn_nav_accounts.grid(row=4, column=0, padx=10, pady=5, sticky="ew")
+        self.page_accounts = AccountPage(self, self)
 
         self.page_groups = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
         self.page_queue = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
@@ -1802,12 +1871,16 @@ class App(ctk.CTk):
         self.page_groups.grid_forget()
         self.page_queue.grid_forget()
         self.page_settings.grid_forget()
+        self.page_accounts.grid_forget()
+        self.btn_nav_accounts.configure(fg_color=("gray75", "gray25") if page_name == "accounts" else "transparent")
 
         self.btn_nav_groups.configure(fg_color=("gray75", "gray25") if page_name == "groups" else "transparent")
         self.btn_nav_queue.configure(fg_color=("gray75", "gray25") if page_name == "queue" else "transparent")
         self.btn_nav_settings.configure(fg_color=("gray75", "gray25") if page_name == "settings" else "transparent")
 
-        if page_name == "groups":
+        if page_name == "accounts":
+            self.page_accounts.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
+        elif page_name == "groups":
             self.page_groups.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
         elif page_name == "queue":
             self.page_queue.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
@@ -2019,6 +2092,9 @@ class App(ctk.CTk):
         return [e for e in self.all_chats if e.id in self.selected_chat_ids]
 
     def on_scan_extensions(self):
+        if self.page_accounts.busy or (self.backend.accounts and not self.backend.authorized):
+            self.set_status("Finish connecting your account first.")
+            return
         selected = self._selected_dialogs()
         if not selected:
             messagebox.showwarning("Selection Required", "Please select at least one chat in Step 1.")
@@ -2028,6 +2104,9 @@ class App(ctk.CTk):
         self.backend.run_coro(self.backend.scan_extensions(selected))
 
     def on_start_downloads(self):
+        if self.page_accounts.busy or (self.backend.accounts and not self.backend.authorized):
+            self.set_status("Finish connecting your account first.")
+            return
         selected_dialogs = self._selected_dialogs()
         if not selected_dialogs:
             messagebox.showwarning("Selection Required", "Please select at least one chat in Step 1.")
@@ -2063,6 +2142,9 @@ class App(ctk.CTk):
         self.set_status(f"Cleared {removed} finished item(s).")
 
     def on_retry_failed(self):
+        if self.page_accounts.busy or (self.backend.accounts and not self.backend.authorized):
+            self.set_status("Finish connecting your account first.")
+            return
         count = self.backend.retry_failed()
         self.set_status(f"Requeued {count} item(s)." if count else "Nothing to retry.")
 
@@ -2171,34 +2253,39 @@ def load_credentials() -> Tuple[int, str]:
             f"Create a .env file next to the app ({BASE_DIR}) containing:\n"
             "  TG_API_ID=your_id\n  TG_API_HASH=your_hash"
         )
+    return validate_credentials(api_id, api_hash)
+
+
+def load_account_store():
+    """Load saved profiles, importing the legacy environment only on first use."""
     try:
-        return int(api_id), api_hash
+        api_id, api_hash = load_credentials()
     except ValueError:
-        raise ValueError("TG_API_ID must be a whole number.") from None
+        api_id, api_hash = 0, ""
+    session_name = os.getenv("TG_SESSION_NAME", "downloader_session")
+    session_path = session_name if os.path.isabs(session_name) else os.path.join(BASE_DIR, session_name)
+    legacy = (api_id, api_hash, session_path) if api_id else None
+    return AccountStore(BASE_DIR, legacy=legacy)
 
 
 def main():
     """Entry point for both `python interactive_downloader.py` and the tg-download script."""
     configure_logging()
     try:
-        api_id, api_hash = load_credentials()
-    except ValueError as e:
-        # A GUI app must not die into an invisible stdout; show a real dialog.
-        logger.error("%s", e)
-        try:
-            import tkinter as tk
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror("Cannot start Telegram Downloader", str(e))
-            root.destroy()
-        except Exception:
-            print(f"❌ {e}", file=sys.stderr)
+        accounts = load_account_store()
+    except ValueError as exc:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Cannot read saved accounts", str(exc))
+        root.destroy()
         return 1
-
-    session_name = os.getenv("TG_SESSION_NAME", "downloader_session")
-    session_path = session_name if os.path.isabs(session_name) else os.path.join(BASE_DIR, session_name)
-
-    backend = TelegramBackend(api_id, api_hash, session_path)
+    profile = accounts.data["profiles"].get(accounts.data["active"])
+    if profile:
+        api_id, api_hash, session_path = profile["api_id"], profile["api_hash"], profile["session"]
+    else:
+        api_id, api_hash, session_path = 0, "", os.path.join(BASE_DIR, "downloader_session")
+    backend = TelegramBackend(api_id, api_hash, session_path, accounts=accounts)
     app = App(backend)
     try:
         app.mainloop()
