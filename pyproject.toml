@@ -26,7 +26,7 @@ dev = [
 tg-download = "interactive_downloader:main"  # creates a CLI executable on install
 
 [tool.setuptools]
-py-modules = ["interactive_downloader", "telegram_auth"]
+py-modules = ["interactive_downloader", "telegram_auth", "queue_state", "transfer_scheduler", "download_storage"]
 
 [tool.ruff]
 line-length = 110

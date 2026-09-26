@@ -1,0 +1,2 @@
+fanout {"selected_groups": 100, "max_parallel_files": 1, "simultaneous_history_iterators": 100}
+fairness {"active_chat_ids": [1, 1, 1], "second_group_queued": 4, "first_group_blocked_downloads": 3}

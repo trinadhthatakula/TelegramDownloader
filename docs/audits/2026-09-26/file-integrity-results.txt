@@ -1,0 +1,6 @@
+'truncated.mp4': expected 4.0 KB, wrote 1 B.
+Download of 'active.mp4' failed: download produced no file
+concurrent_collision {"statuses": ["Completed", "Completed"], "surviving_files": 1}
+false_duplicates {"unrelated_message": "Skipped (Exists)", "other_same_title_chat": "Skipped (Exists)", "total_transfer_calls": 2}
+truncated_result {"declared_bytes": 4096, "written_bytes": 1, "status": "Completed"}
+active_cleanup {"counted_as_orphan": 1, "deleted": 1, "worker_status": "Queued", "retries": 1}

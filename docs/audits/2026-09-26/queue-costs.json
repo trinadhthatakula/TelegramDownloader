@@ -1,0 +1,37 @@
+{
+  "probe": "Headless CPU only; no Tk, network or disk transfer time included. 10 chats, 3 active files.",
+  "measurements": [
+    {
+      "retained_items": 1000,
+      "ui_summary_scan_ms": 0.065,
+      "ui_group_filter_scan_ms": 0.008,
+      "ui_all_list_copy_ms": 0.001,
+      "scheduler_when_all_slots_busy_ms": 0.007,
+      "refill_count_scan_ms": 0.01
+    },
+    {
+      "retained_items": 10000,
+      "ui_summary_scan_ms": 1.046,
+      "ui_group_filter_scan_ms": 0.088,
+      "ui_all_list_copy_ms": 0.019,
+      "scheduler_when_all_slots_busy_ms": 0.062,
+      "refill_count_scan_ms": 0.105
+    },
+    {
+      "retained_items": 100000,
+      "ui_summary_scan_ms": 10.548,
+      "ui_group_filter_scan_ms": 1.348,
+      "ui_all_list_copy_ms": 0.276,
+      "scheduler_when_all_slots_busy_ms": 0.683,
+      "refill_count_scan_ms": 1.428
+    },
+    {
+      "retained_items": 300000,
+      "ui_summary_scan_ms": 33.278,
+      "ui_group_filter_scan_ms": 5.263,
+      "ui_all_list_copy_ms": 2.035,
+      "scheduler_when_all_slots_busy_ms": 2.203,
+      "refill_count_scan_ms": 5.653
+    }
+  ]
+}

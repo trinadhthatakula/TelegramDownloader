@@ -2,20 +2,23 @@
 
 Run:  .venv/bin/python tests_smoke.py
 """
-import os
-import sys
-import time
-import shutil
 import asyncio
+import os
+import shutil
+import sys
 import tempfile
+import threading
+import time
 import traceback
+from pathlib import Path
+from types import SimpleNamespace
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
 TMP_ROOT = tempfile.mkdtemp(prefix="tgdl-test-")
 
-import interactive_downloader as dl  # noqa: E402
+import interactive_downloader as dl
 
 # Keep the real config.json / log untouched.
 dl.CONFIG_FILE = os.path.join(TMP_ROOT, "config.json")
@@ -166,6 +169,13 @@ class RawDialog:
         self.entity = FakeEntity(did, name, bot=bot)
 
 
+async def write_fake_media(file, data):
+    if hasattr(file, "write"):
+        await file.write(data)
+    else:
+        await asyncio.to_thread(Path(file).write_bytes, data)
+
+
 class FakeClient:
     """Minimal stand-in for TelegramClient covering the paths the app uses."""
 
@@ -174,6 +184,9 @@ class FakeClient:
         self.floods_left = fail_first_n_floods
         self.download_error = download_error
         self.downloads = 0
+
+    async def disconnect(self):
+        pass
 
     def _messages_for(self, entity):
         cid = entity.id if hasattr(entity, "id") else entity
@@ -201,17 +214,38 @@ class FakeClient:
             raise self.download_error
         self.downloads += 1
         size = message.file.size
-        with open(file, "wb") as fh:
-            fh.write(b"\xab" * size)
+        await write_fake_media(file, b"\xab" * size)
         if progress_callback:
             progress_callback(size, size)
         return file
 
 
-def make_backend(out_dir, parallel=3):
+def make_backend(out_dir, parallel=3, fast_timers=False):
     b = dl.TelegramBackend(1, "hash", os.path.join(TMP_ROOT, "sess"))
     b.config = {"output_dir": out_dir, "max_parallel_files": parallel, "scan_depth": 0}
+    if fast_timers:
+        # Fault-injection tests exercise retry budgets without waiting real seconds.
+        # Separate tests below retain the actual backoff/FloodWait clocks.
+        call_later = b.loop.call_later
+
+        def accelerated(delay, callback, *args, **kwargs):
+            return call_later(min(delay, 0.02), callback, *args, **kwargs)
+
+        b.loop.call_later = accelerated
     return b
+
+
+def seed_partial(backend, dialog, message, data):
+    """Create resumable bytes with a verified account/chat/media manifest identity."""
+    state = backend._make_chat_job(dialog, frozenset(), True)
+    item = backend._make_download_item(state, message, message.file.ext)
+    account = f"session:{os.path.abspath(backend.session_path)}"
+    storage = dl.get_storage(backend.config["output_dir"])
+    reservation = storage.prepare(account, dialog.id, dl.sanitize_chat_dir(dialog.name, dialog.id),
+                                  item.file_name, dl.media_identity(account, item))
+    Path(reservation.temp_path).write_bytes(data)
+    storage.release(reservation)
+    return reservation
 
 
 def drain(backend, timeout=15.0, settle=0.4):
@@ -303,8 +337,9 @@ def test_path_traversal():
             [FakeDialog(777, "../../escape-chat")], set(), all_formats=True)).result(10)
         drain(b)
 
-        written = [os.path.join(dp, f) for dp, _, fs in os.walk(out) for f in fs]
-        check("4 media files written", len(written) == 4, str(written))
+        written = [item.output_path for item in b.snapshot_queue() if item.status == "Completed"]
+        check("4 media files written", len(written) == 4 and all(os.path.isfile(p) for p in written),
+              str(written))
         check("every file inside output_dir", all(dl.is_within(out, p) for p in written))
         check("nothing escaped to /tmp", not os.path.exists("/tmp/tgdl-escape.mp4"))
         check("chat dir did not escape",
@@ -324,7 +359,7 @@ def test_unwritable_dir_frees_slots():
     out = os.path.join(ro, "nope")
     os.makedirs(out, exist_ok=True)
     os.chmod(out, 0o500)  # exists but no new subdirectories allowed
-    b = make_backend(out, parallel=2)
+    b = make_backend(out, parallel=2, fast_timers=True)
     try:
         b.client = FakeClient({888: [FakeMessage(i, f"x_{i}.mp4") for i in range(1, 9)]})
         b.run_coro(b.enqueue_selected_chats([FakeDialog(888, "Locked")], set(), all_formats=True)).result(10)
@@ -367,7 +402,7 @@ def test_collision_and_skip():
 
     same = os.path.join(chat_dir, "same.mp4")
     with open(same, "wb") as fh:
-        fh.write(b"\xab" * 4096)  # identical size -> should be skipped
+        fh.write(b"\xcd" * 4096)  # Equal size is insufficient evidence of media identity.
     other = os.path.join(chat_dir, "other.mp4")
     with open(other, "wb") as fh:
         fh.write(b"PRECIOUS")  # different size -> must not be destroyed
@@ -378,12 +413,28 @@ def test_collision_and_skip():
         b.run_coro(b.enqueue_selected_chats([FakeDialog(555, "Dupes")], set(), all_formats=True)).result(10)
         drain(b)
         st = statuses(b)
-        check("identical file skipped", st.get("555_1") == "Skipped (Exists)", str(st))
+        check("unindexed equal-size file is not falsely skipped", st.get("555_1") == "Completed", str(st))
         check("colliding file completed", st.get("555_2") == "Completed", str(st))
-        check("pre-existing file untouched", open(other, "rb").read() == b"PRECIOUS")
+        check("both pre-existing files untouched", Path(other).read_bytes() == b"PRECIOUS"
+              and Path(same).read_bytes() == b"\xcd" * 4096)
+        check("same-size collision saved separately",
+              Path(chat_dir, "same (2).mp4").read_bytes() == b"\xab" * 4096)
         check("collision saved as 'other (2).mp4'", os.path.exists(os.path.join(chat_dir, "other (2).mp4")),
               str(sorted(os.listdir(chat_dir))))
-        check("only one download happened", b.client.downloads == 1, str(b.client.downloads))
+        check("both unverified messages were downloaded", b.client.downloads == 2, str(b.client.downloads))
+
+        # A new backend has no in-memory queue deduplication: only the persisted
+        # media identity and checksum can justify these skips.
+        b.shutdown()
+        b = make_backend(out, parallel=1)
+        b.client = FakeClient({555: [FakeMessage(1, "same.mp4"), FakeMessage(2, "other.mp4")]})
+        b.run_coro(b.enqueue_selected_chats([FakeDialog(555, "Dupes")], set(), all_formats=True)).result(10)
+        drain(b)
+        restarted = statuses(b)
+        check("verified media skipped after restart",
+              len(restarted) == 2 and all(status == "Skipped (Exists)" for status in restarted.values()),
+              str(restarted))
+        check("verified restart transfers no bytes", b.client.downloads == 0, str(b.client.downloads))
     finally:
         b.shutdown()
 
@@ -417,7 +468,7 @@ def test_fetch_backoff():
 def test_queue_operations():
     print("\n[11] queue actions")
     out = os.path.join(TMP_ROOT, "ops")
-    b = make_backend(out, parallel=1)
+    b = make_backend(out, parallel=1, fast_timers=True)
     try:
         b.client = FakeClient({666: [FakeMessage(i, f"o_{i}.mp4") for i in range(1, 5)]},
                               download_error=OSError("disk on fire"))
@@ -427,13 +478,13 @@ def test_queue_operations():
         check("failures are terminal", all(v == "Failed" for v in st.values()), str(st))
 
         b.client.download_error = None
-        n = b.retry_failed()
+        n = b.retry_failed().result(10)
         check("retry_failed requeued everything", n == 4, str(n))
         drain(b, timeout=30)
         check("all complete after retry",
               all(v == "Completed" for v in statuses(b).values()), str(statuses(b)))
 
-        removed = b.clear_completed()
+        removed = b.clear_completed().result(10)
         check("clear_completed drops finished rows", removed == 4 and not b.download_queue, str(removed))
         check("queue_index cleared with it", not b.queue_index)
 
@@ -455,23 +506,29 @@ def test_cancel():
 
     class SlowClient(FakeClient):
         async def download_media(self, message, file=None, progress_callback=None):
-            open(file, "wb").close()
+            await write_fake_media(file, b"\xab" * 2048)
+            self.downloads += 1
+            if self.downloads == 2:
+                started.set()
             await asyncio.sleep(30)
 
+    started = threading.Event()
     b = make_backend(out, parallel=2)
     try:
         b.client = SlowClient({321: [FakeMessage(i, f"c_{i}.mp4") for i in range(1, 7)]})
         b.run_coro(b.enqueue_selected_chats([FakeDialog(321, "Slow")], set(), all_formats=True)).result(10)
-        time.sleep(1.5)
+        check("both partial writes started", started.wait(5))
         with b.queue_lock:
             active = [i for i in b.download_queue if i.status == "Downloading"]
         check("downloads actually started", len(active) == 2, str(len(active)))
-        b.cancel_all()
-        time.sleep(1.5)
+        b.cancel_all().result(10)
         st = statuses(b)
         check("everything cancelled", all(v == "Cancelled" for v in st.values()), str(set(st.values())))
-        check("cancelled .part files cleaned up",
-              not any(f.endswith(".part") for _, _, fs in os.walk(out) for f in fs))
+        parts = [Path(dp, name) for dp, _, files in os.walk(out) for name in files if name.endswith(".part")]
+        check("cancelled transfers preserve resumable bytes",
+              len(parts) == 2 and all(path.read_bytes() == b"\xab" * 2048 for path in parts))
+        check("cleanup excludes owned resumable fragments", b.sweep_orphan_parts() == (0, 0))
+        check("cancel has drained worker ownership", not b._active_workers)
     finally:
         b.shutdown()
 
@@ -484,8 +541,6 @@ def test_resume():
 
     total = 3 * dl.RESUME_ALIGN
     already = 2 * dl.RESUME_ALIGN
-    with open(os.path.join(chat_dir, ".314_1.part"), "wb") as fh:
-        fh.write(b"\xab" * already)
 
     class ChunkClient(FakeClient):
         def __init__(self, chats):
@@ -512,6 +567,7 @@ def test_resume():
     try:
         client = ChunkClient({314: [FakeMessage(1, "big.mp4", size=total)]})
         b.client = client
+        seed_partial(b, FakeDialog(314, "Resume"), client.chats[314][0], b"\xab" * already)
         b.run_coro(b.enqueue_selected_chats([FakeDialog(314, "Resume")], set(), all_formats=True)).result(10)
         drain(b, timeout=30)
         st = statuses(b)
@@ -531,11 +587,12 @@ def test_resume_falls_back():
     chat_dir = os.path.join(out, "Broken")
     os.makedirs(chat_dir, exist_ok=True)
     total = 3 * dl.RESUME_ALIGN
-    with open(os.path.join(chat_dir, ".271_1.part"), "wb") as fh:
-        fh.write(b"\xab" * (2 * dl.RESUME_ALIGN))
 
     class TruncatingClient(FakeClient):
+        resumes = 0
+
         def iter_download(self, message, offset=0, request_size=None):
+            self.resumes += 1
             async def gen():
                 await asyncio.sleep(0)
                 # Stops well short of the end: a truncated resume.
@@ -546,12 +603,14 @@ def test_resume_falls_back():
     try:
         client = TruncatingClient({271: [FakeMessage(1, "big.mp4", size=total)]})
         b.client = client
+        seed_partial(b, FakeDialog(271, "Broken"), client.chats[271][0], b"\xab" * (2 * dl.RESUME_ALIGN))
         b.run_coro(b.enqueue_selected_chats([FakeDialog(271, "Broken")], set(), all_formats=True)).result(10)
         drain(b, timeout=30)
         final = os.path.join(chat_dir, "big.mp4")
         check("truncated resume did not fail the item", statuses(b).get("271_1") == "Completed",
               str(statuses(b)))
         check("fell back to a full download", client.downloads == 1, str(client.downloads))
+        check("verified partial really attempted a resume", client.resumes == 1, str(client.resumes))
         check("final file is the full size",
               os.path.exists(final) and os.path.getsize(final) == total,
               str(os.path.getsize(final)) if os.path.exists(final) else "missing")
@@ -559,25 +618,61 @@ def test_resume_falls_back():
         b.shutdown()
 
 
+def test_unindexed_partial_is_not_resumed():
+    print("\n[14b] legacy partial bytes require a matching manifest identity")
+    out = os.path.join(TMP_ROOT, "unindexed-part")
+    folder = Path(out, "Legacy")
+    folder.mkdir(parents=True)
+    legacy = folder / ".274_1.part"
+    original = b"unverified" * dl.RESUME_ALIGN
+    legacy.write_bytes(original)
+
+    class GuardClient(FakeClient):
+        resumes = 0
+
+        def iter_download(self, *args, **kwargs):
+            self.resumes += 1
+            raise AssertionError("unindexed bytes must not be reused")
+
+    b = make_backend(out, parallel=1)
+    try:
+        b.client = GuardClient({274: [FakeMessage(1, "whole.mp4", size=3 * dl.RESUME_ALIGN)]})
+        b.run_coro(b.enqueue_selected_chats([FakeDialog(274, "Legacy")], set(), all_formats=True)).result(10)
+        drain(b)
+        check("unindexed partial was never resumed", b.client.resumes == 0)
+        check("unindexed bytes preserved", legacy.read_bytes() == original)
+        check("verified media downloaded independently", statuses(b).get("274_1") == "Completed"
+              and b.client.downloads == 1)
+        check("independent complete file has correct bytes",
+              (folder / "whole.mp4").read_bytes() == b"\xab" * (3 * dl.RESUME_ALIGN))
+    finally:
+        b.shutdown()
+
+
 def test_size_mismatch_tolerated():
-    print("\n[15] an inexact reported size does not fail the download")
+    print("\n[15] photo estimates are tolerated; incomplete documents fail")
     out = os.path.join(TMP_ROOT, "mismatch")
 
     class ShortClient(FakeClient):
         async def download_media(self, message, file=None, progress_callback=None):
             self.downloads += 1
-            with open(file, "wb") as fh:
-                fh.write(b"\xab" * (message.file.size - 17))  # photos report estimates
+            await write_fake_media(file, b"\xab" * (message.file.size - 17))
             return file
 
-    b = make_backend(out, parallel=1)
+    b = make_backend(out, parallel=2, fast_timers=True)
     try:
-        b.client = ShortClient({272: [FakeMessage(1, "photo.jpg", size=4096, ext=".jpg")]})
+        photo = FakeMessage(1, "photo.jpg", size=4096, ext=".jpg")
+        photo.photo = SimpleNamespace(id=1)
+        document = FakeMessage(2, "document.jpg", size=4096, ext=".jpg")
+        document.document = SimpleNamespace(id=2)
+        b.client = ShortClient({272: [photo, document]})
         b.run_coro(b.enqueue_selected_chats([FakeDialog(272, "Photos")], set(), all_formats=True)).result(10)
         drain(b, timeout=20)
-        check("completed despite the size mismatch", statuses(b).get("272_1") == "Completed",
+        check("Telegram photo completed despite its size estimate", statuses(b).get("272_1") == "Completed",
               str(statuses(b)))
-        check("file kept", os.path.exists(os.path.join(out, "Photos", "photo.jpg")))
+        check("photo bytes kept", Path(out, "Photos", "photo.jpg").read_bytes() == b"\xab" * 4079)
+        check("short document is Failed", statuses(b).get("272_2") == "Failed", str(statuses(b)))
+        check("short document was not promoted", not Path(out, "Photos", "document.jpg").exists())
     finally:
         b.shutdown()
 
@@ -589,10 +684,10 @@ def test_empty_download_fails():
     class EmptyClient(FakeClient):
         async def download_media(self, message, file=None, progress_callback=None):
             self.downloads += 1
-            open(file, "wb").close()
+            await write_fake_media(file, b"")
             return file
 
-    b = make_backend(out, parallel=1)
+    b = make_backend(out, parallel=1, fast_timers=True)
     try:
         b.client = EmptyClient({273: [FakeMessage(1, "nothing.mp4")]})
         b.run_coro(b.enqueue_selected_chats([FakeDialog(273, "Empty")], set(), all_formats=True)).result(10)
@@ -638,6 +733,9 @@ class DialogClient:
         self.main_list, self.archived_list = main_list, archived_list
         self.floods, self.fail_archive = floods, fail_archive
         self.calls = []
+
+    async def disconnect(self):
+        pass
 
     def iter_dialogs(self, limit=None, archived=False):
         self.calls.append(archived)
@@ -718,12 +816,12 @@ def main():
                test_unwritable_dir_frees_slots, test_flood_requeue,
                test_collision_and_skip, test_fetch_backoff,
                test_queue_operations, test_cancel, test_resume,
-               test_resume_falls_back, test_size_mismatch_tolerated,
+               test_resume_falls_back, test_unindexed_partial_is_not_resumed, test_size_mismatch_tolerated,
                test_empty_download_fails, test_chat_entry_classification,
                test_dialog_enumeration):
         try:
             fn()
-        except Exception:
+        except Exception:  # noqa: BLE001 - collect independent smoke-test failures.
             FAIL.append(fn.__name__)
             print(f"  ERROR in {fn.__name__}:")
             traceback.print_exc()

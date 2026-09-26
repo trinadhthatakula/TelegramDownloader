@@ -38,7 +38,7 @@ def make_items(n, chats=7):
             id=f"{cid}_{i}", chat_id=cid, chat_name=f"Chat {cid}",
             message=None, file_name=f"VID_2024042{i % 10}_1113{i:05d}.mp4",
             msg_id=i, ext=".mp4", file_size=7 * 1024 * 1024,
-            status="Downloading" if i % 13 == 0 else "Queued",
+            status="Downloading" if i < 3 else "Completed",
             progress=(i % 100) / 100.0, downloaded_bytes=i * 1024, speed=1.2e6,
         ))
     return out
@@ -51,8 +51,11 @@ def bench_new():
     backend.init_client = lambda: asyncio.sleep(0)  # no network
 
     app = dl.App(backend)
+    app.select_page("queue")
     app.update_idletasks()
     app.update()
+    app._resize_list("queue")
+    app.update_idletasks()
 
     results = []
     for n in SIZES:
@@ -60,6 +63,7 @@ def bench_new():
         with backend.queue_lock:
             backend.download_queue = items
             backend.queue_index = {i.id: i for i in items}
+            backend._queue_items_added(items)
 
         app.queue_offset = 0
         app._render_queue_window()
@@ -71,10 +75,12 @@ def bench_new():
             more = make_items(BATCH)
             for j, it in enumerate(more):
                 it.id = f"{it.chat_id}_extra{k}_{j}"
+                it.status = "Queued"
             with backend.queue_lock:
                 backend.download_queue.extend(more)
                 for it in more:
                     backend.queue_index[it.id] = it
+                backend._queue_items_added(more)
             t0 = time.perf_counter()
             app._render_queue_window()
             app._update_summary()
@@ -98,9 +104,9 @@ def bench_new():
         app.update_idletasks()
         scroll = (time.perf_counter() - t0) * 1000
 
-        widgets = len(app.queue_rows) * 5
+        widgets = len(app.queue_rows) * 7
         results.append((n, repaint, prog, scroll, widgets))
-        say(f"  n={n:>5}  repaint={repaint:7.1f} ms   12 progress ticks={prog:6.2f} ms"
+        say(f"  n={n:>5}  repaint={repaint:7.1f} ms   {len(visible)} progress ticks={prog:6.2f} ms"
             f"   scroll-to-end={scroll:6.2f} ms   row widgets={widgets}")
 
     app.destroy()
@@ -179,7 +185,9 @@ if __name__ == "__main__":
             f"{'speedup':>8} | widgets before/after")
         say("-" * 74)
         by_n = {n: r for n, r, _p, _s, _w in new}
-        widgets_after = dl.ROW_POOL_SIZE * 5
+        widgets_after = new[0][-1]
         for n, o, ow in old:
+            if n not in by_n:
+                continue
             r = by_n[n]
             say(f"{n:>11} | {o:>12.1f} | {r:>11.1f} | {o / r:>7.0f}x | {ow:>6} / {widgets_after}")

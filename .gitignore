@@ -12,6 +12,11 @@ sessions/
 config.json
 downloader.log*
 telegram_downloads/
+.telegram-downloader.sqlite3
+.telegram-downloader.sqlite3-journal
+.telegram-downloader.sqlite3-wal
+.telegram-downloader.sqlite3-shm
+.tgdl-*.part
 
 # Python
 __pycache__/

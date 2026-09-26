@@ -13,10 +13,14 @@ from dataclasses import dataclass
 from typing import Dict, List, Set, Tuple, Optional, Any
 
 import customtkinter as ctk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 from dotenv import load_dotenv
 from telethon import TelegramClient, errors
 from telegram_auth import AccountStore, AccountPage, AuthenticationMixin, validate_credentials
+from queue_state import CoalescingEventQueue, QueueViewIndex, QueueTotals as QueueStats
+import transfer_scheduler as scheduler
+from transfer_scheduler import TransferSchedulerMixin
+from download_storage import get_storage, media_identity, AsyncDiskSink, IncompleteDownloadError
 
 # All app-owned paths resolve against the script directory, never the working
 # directory: launching from elsewhere used to scatter config.json / downloader.log
@@ -25,11 +29,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOG_FILE = os.path.join(BASE_DIR, "downloader.log")
 
-# Downloads are dispatched in fixed slots; a batch fetch scans this many messages
-# looking for at most TARGET_BATCH_SIZE matches before yielding.
-MESSAGE_SCAN_WINDOW = 200
-TARGET_BATCH_SIZE = 50
-QUEUE_REFILL_THRESHOLD = 15
+# Scheduler tuning lives in transfer_scheduler; aliases remain available
+# to integrations and the extension preview scanner.
+MESSAGE_SCAN_WINDOW = scheduler.SCAN_WINDOW
+TARGET_BATCH_SIZE = scheduler.PER_CHAT_PENDING_LIMIT
+QUEUE_REFILL_THRESHOLD = scheduler.REFILL_THRESHOLD
+FETCH_BACKOFF = scheduler.FETCH_BACKOFF
 
 # Telegram requires download offsets and chunk sizes to be 4 KiB aligned; 512 KiB
 # is Telethon's MAX_CHUNK_SIZE and the largest legal request size.
@@ -37,8 +42,6 @@ RESUME_ALIGN = 512 * 1024
 
 # Retry budget per item before it becomes terminally Failed.
 MAX_ITEM_RETRIES = 3
-# Backoff schedule (seconds) for repeated batch-fetch failures on one chat.
-FETCH_BACKOFF = (2, 5, 15, 45, 120)
 
 MAX_FILENAME_LEN = 120
 # Deny-list, deliberately not an allow-list: path separators, control characters
@@ -237,6 +240,7 @@ class DownloadItem:
     task: Optional[asyncio.Task] = None
     last_update_time: float = 0.0
     last_bytes: int = 0
+    output_dir: Optional[str] = None
 
 
 # Sort/display order for the chat picker. Groups are what this tool downloads
@@ -286,6 +290,16 @@ class ChatPaginationState:
     total_completed: int = 0
     consecutive_errors: int = 0
     retry_armed: bool = False
+    chosen_exts: frozenset = frozenset()
+    all_formats: bool = True
+    generation: int = 0
+    paused: bool = False
+    cancelled: bool = False
+    discovery_started: bool = False
+    last_error: str = ""
+    newest_msg_id: int = 0
+    stop_msg_id: int = 0
+    output_dir: Optional[str] = None
 
 
 @dataclass
@@ -295,21 +309,14 @@ class ChatSnapshot:
     chat_name: str
     total_discovered: int
     total_completed: int
-
-
-@dataclass
-class QueueStats:
-    total: int = 0
-    active: int = 0
+    status: str = "Queued"
     queued: int = 0
-    done: int = 0
+    active: int = 0
     failed: int = 0
-    speed: float = 0.0
-    downloaded: int = 0
-    total_bytes: int = 0
+    paused: bool = False
 
 
-class TelegramBackend(AuthenticationMixin):
+class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
     def __init__(self, api_id: int, api_hash: str, session_path: str, accounts=None):
         self.api_id = api_id
         self.api_hash = api_hash
@@ -318,7 +325,7 @@ class TelegramBackend(AuthenticationMixin):
         self._account_resetting = False
         self._account_generation = 0
 
-        self.event_queue: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+        self.event_queue = CoalescingEventQueue()
         self.config = load_config()
 
         self.client: Optional[TelegramClient] = None
@@ -332,6 +339,12 @@ class TelegramBackend(AuthenticationMixin):
 
         self.queue_lock = threading.RLock()
         self.states_lock = threading.RLock()
+        self._view_index = QueueViewIndex()
+        self._view_source = self.download_queue
+        self._view_length = 0
+        self.latest_scan_generation = 0
+        self._extension_scan_task = None
+        self._config_save_lock = asyncio.Lock()
         self.last_dispatched_chat_id: Optional[int] = None
 
         # Global rate-limit gate. While flood_until is in the future no new
@@ -349,7 +362,44 @@ class TelegramBackend(AuthenticationMixin):
 
     def emit_event(self, event_type: str, data: Any = None):
         """Thread-safe event dispatch to the Tk thread."""
+        if event_type in ("item_updated", "item_progress") and isinstance(data, DownloadItem):
+            self._item_state_changed(data)
         self.event_queue.put((event_type, data))
+
+    def _ensure_view_index(self):
+        # Legacy integrations/tests may replace the list directly. Normal writes
+        # use the hooks below and never need this O(history) rebuild.
+        if self._view_source is not self.download_queue or self._view_length != len(self.download_queue):
+            self._view_index.rebuild(self.download_queue)
+            self._view_source = self.download_queue
+            self._view_length = len(self.download_queue)
+
+    def _queue_items_added(self, items):
+        with self.queue_lock:
+            if (self._view_source is not self.download_queue
+                    or self._view_length + len(items) != len(self.download_queue)):
+                self._view_index.rebuild(self.download_queue)
+            for item in items:
+                self._view_index.change(item)
+            self._view_source = self.download_queue
+            self._view_length = len(self.download_queue)
+
+    def _queue_items_removed(self, items):
+        with self.queue_lock:
+            self._view_index.rebuild(self.download_queue)
+            self._view_source = self.download_queue
+            self._view_length = len(self.download_queue)
+
+    def _item_state_changed(self, item):
+        with self.queue_lock:
+            self._ensure_view_index()
+            if self.queue_index.get(item.id) is item or item.id in self._view_index.previous:
+                self._view_index.change(item)
+
+    def snapshot_queue_window(self, chat_filter=None, offset=0, limit=40):
+        with self.queue_lock:
+            self._ensure_view_index()
+            return self._view_index.window(chat_filter, offset, limit)
 
     def report_error(self, message: str):
         logger.error(message)
@@ -432,7 +482,8 @@ class TelegramBackend(AuthenticationMixin):
         self.authorized = False
         self._account_generation += 1
         try:
-            self.cancel_all(exclude_task=asyncio.current_task())
+            self.cancel_extension_scan()
+            await self._reset_scheduler()
             pending = [t for t in self._pending_tasks if t is not asyncio.current_task()]
             for task in pending:
                 task.cancel()
@@ -441,6 +492,7 @@ class TelegramBackend(AuthenticationMixin):
             with self.queue_lock:
                 self.download_queue.clear()
                 self.queue_index.clear()
+                self._queue_items_removed([])
             with self.states_lock:
                 self.pagination_states.clear()
             self.chosen_exts.clear()
@@ -466,10 +518,32 @@ class TelegramBackend(AuthenticationMixin):
         aborted the whole event-processing tick.
         """
         with self.states_lock:
-            return [
-                ChatSnapshot(s.chat_id, s.chat_name, s.total_discovered, s.total_completed)
-                for s in self.pagination_states.values()
-            ]
+            states = list(self.pagination_states.values())
+        snapshots = []
+        for state in states:
+            counts = self.queue_stats(state.chat_id)
+            if state.paused:
+                status = "Paused"
+            elif state.cancelled:
+                status = "Cancelled"
+            elif time.monotonic() < self.flood_until and (state.has_more or counts.queued):
+                status = "Waiting for Telegram"
+            elif counts.active:
+                status = "Downloading"
+            elif state.fetching_in_progress:
+                status = "Discovering"
+            elif state.retry_armed:
+                status = "Retrying discovery"
+            elif counts.queued or state.has_more:
+                status = "Queued"
+            elif counts.failed or state.last_error:
+                status = "Failed"
+            else:
+                status = "Finished"
+            snapshots.append(ChatSnapshot(state.chat_id, state.chat_name, state.total_discovered,
+                                          state.total_completed, status, counts.queued,
+                                          counts.active, counts.failed, state.paused))
+        return snapshots
 
     def snapshot_queue(self, chat_filter: Optional[int] = None) -> List[DownloadItem]:
         with self.queue_lock:
@@ -477,33 +551,27 @@ class TelegramBackend(AuthenticationMixin):
                 return list(self.download_queue)
             return [it for it in self.download_queue if it.chat_id == chat_filter]
 
-    def queue_stats(self) -> QueueStats:
-        stats = QueueStats()
+    def queue_stats(self, chat_filter=None) -> QueueStats:
         with self.queue_lock:
-            for it in self.download_queue:
-                stats.total += 1
-                stats.total_bytes += it.file_size or 0
-                if it.status == "Downloading":
-                    stats.active += 1
-                    stats.speed += it.speed
-                    stats.downloaded += it.downloaded_bytes
-                elif it.status == "Queued":
-                    stats.queued += 1
-                elif it.status in ("Completed", "Skipped (Exists)"):
-                    stats.done += 1
-                    stats.downloaded += it.file_size or 0
-                elif it.status.startswith("Failed") or it.status == "Cancelled":
-                    stats.failed += 1
-        return stats
+            self._ensure_view_index()
+            return self._view_index.snapshot(chat_filter)
 
     def update_config(self, new_config: dict):
-        """Validates, persists and applies new settings."""
-        self.config = validate_config({**self.config, **new_config})
-        err = save_config(self.config)
-        if err:
-            self.report_error(f"Could not save settings: {err}")
-        logger.info("Configuration updated: %s", self.config)
-        self._schedule_downloads()
+        """Synchronous facade for background callers; state commits on the loop."""
+        if threading.current_thread() is self.thread:
+            raise RuntimeError("Use await apply_config() on the backend loop.")
+        return self.run_coro(self.apply_config(new_config)).result()
+
+    async def apply_config(self, new_config):
+        async with self._config_save_lock:
+            updated = validate_config({**self.config, **new_config})
+            error = await asyncio.to_thread(save_config, updated)
+            if error:
+                self.report_error(f"Could not save settings: {error}")
+                return error
+            self.config = updated
+            self._schedule_downloads()
+            return None
 
     # ------------------------------------------------------------------ client
 
@@ -584,316 +652,112 @@ class TelegramBackend(AuthenticationMixin):
                 await asyncio.sleep(wait + 1)
                 # The restart re-walks from the top; dedupe by id makes that safe.
 
-    async def scan_extensions(self, selected_dialogs: "List[ChatEntry]"):
-        """Scans recent history across selected chats to discover media extensions."""
-        if self.accounts and not self.authorized:
+    def begin_extension_scan(self, selected_dialogs):
+        self.latest_scan_generation += 1
+        generation = self.latest_scan_generation
+        selected = tuple(selected_dialogs)
+
+        def begin():
+            if self._extension_scan_task is not None:
+                self._extension_scan_task.cancel()
+            self._spawn(self.scan_extensions(selected, generation))
+        self._call_on_loop(begin)
+        return generation
+
+    def cancel_extension_scan(self):
+        self.latest_scan_generation += 1
+        def cancel():
+            if self._extension_scan_task is not None:
+                self._extension_scan_task.cancel()
+        self._call_on_loop(cancel)
+
+    async def scan_extensions(self, selected_dialogs, generation=None):
+        """One cancellable preview scan; obsolete results never replace selections."""
+        if generation is None:
+            self.latest_scan_generation += 1
+            generation = self.latest_scan_generation
+        if generation != self.latest_scan_generation or (self.accounts and not self.authorized):
             return
+        self._extension_scan_task = asyncio.current_task()
+        discovered = set()
+        failures = []
+        status = "completed"
+        scanned = 0
+        limit = self.config.get("scan_depth", 500) or None
 
-        discovered: Set[str] = set()
+        def event(kind, message, **extra):
+            if generation == self.latest_scan_generation:
+                self.emit_event(kind, {"generation": generation, "message": message,
+                                      "extensions": sorted(discovered), "status": status, **extra})
+        event("scan_started", f"Scanning {len(selected_dialogs)} chat(s)...")
         try:
-            scan_limit = self.config.get("scan_depth", 500)
-            limit_val = None if scan_limit == 0 else scan_limit
-            logger.info("Scanning %d chats (depth: %s)...", len(selected_dialogs), limit_val or "unlimited")
-
-            for idx, d in enumerate(selected_dialogs, start=1):
-                self.emit_event("scan_progress", f"Scanning {idx}/{len(selected_dialogs)}: {d.name}")
-                try:
-                    async for msg in self.client.iter_messages(d.entity, limit=limit_val):
-                        if msg.file and msg.file.ext:
-                            discovered.add(msg.file.ext.lower())
-                except (errors.UnauthorizedError, errors.AuthKeyError):
-                    await self.session_invalid()
-                    return
-                except errors.FloodError as e:
-                    wait = getattr(e, "seconds", 0) or 0
-                    logger.warning("Rate limited while scanning '%s': waiting %ss", d.name, wait)
-                    self.emit_event("scan_progress", f"Rate limited, waiting {wait}s...")
-                    await asyncio.sleep(wait + 1)
-                except Exception as e:
-                    logger.warning("Skipping scan of '%s': %s", d.name, e)
-
-            sorted_exts = sorted(discovered)
-            logger.info("Discovered extensions: %s", sorted_exts)
-            self.emit_event("extensions_scanned", sorted_exts)
-        except Exception as e:
-            logger.exception("Error scanning extensions: %s", e)
-            self.report_error(f"Scan failed: {e}")
-            self.emit_event("extensions_scanned", [])
+            for index, dialog in enumerate(selected_dialogs, 1):
+                cursor = 0
+                seen = 0
+                while limit is None or seen < limit:
+                    while time.monotonic() < self.flood_until:
+                        event("scan_progress", f"Waiting for Telegram ({max(1, int(self.flood_until-time.monotonic()))}s)")
+                        await asyncio.sleep(min(1, max(0, self.flood_until-time.monotonic())))
+                    count = 0
+                    try:
+                        page_limit = min(MESSAGE_SCAN_WINDOW, limit-seen) if limit else MESSAGE_SCAN_WINDOW
+                        kwargs = {"limit": page_limit}
+                        if cursor:
+                            kwargs["offset_id"] = cursor
+                        async for message in self.client.iter_messages(dialog.entity, **kwargs):
+                            cursor = message.id
+                            seen += 1
+                            count += 1
+                            scanned += 1
+                            if message.file and message.file.ext:
+                                discovered.add(message.file.ext.lower())
+                            if count % 25 == 0:
+                                event("scan_progress", f"Scanning {index}/{len(selected_dialogs)}: {dialog.name} ({seen} messages)")
+                                await asyncio.sleep(0)
+                        event("scan_progress", f"Scanned {index}/{len(selected_dialogs)}: {dialog.name} ({seen} messages)")
+                        if count < page_limit:
+                            break
+                    except errors.FloodError as exc:
+                        self._enter_flood_wait(getattr(exc, "seconds", 1) or 1)
+                    except (errors.UnauthorizedError, errors.AuthKeyError):
+                        await self.session_invalid()
+                        return
+                    except Exception as exc:
+                        failures.append(f"{dialog.name}: {type(exc).__name__}")
+                        break
+        except asyncio.CancelledError:
+            status = "cancelled"
+            raise
+        finally:
+            if self._extension_scan_task is asyncio.current_task():
+                self._extension_scan_task = None
+            if failures:
+                status = "partial"
+            message = (f"Scan {status}: {len(discovered)} format(s), {scanned} messages."
+                       + (" Failed chats: " + "; ".join(failures) if failures else ""))
+            event("scan_finished", message)
 
     # ------------------------------------------------------------- enqueue/fetch
 
-    async def enqueue_selected_chats(self, selected_dialogs: "List[ChatEntry]", chosen_exts: set,
-                                     all_formats: bool = False):
-        """Prepares per-chat state and kicks off the first batch fetch for each."""
-        if self.accounts and not self.authorized:
-            return
+    def _make_chat_job(self, dialog, formats, all_formats):
+        return ChatPaginationState(
+            chat_id=dialog.id, chat_name=dialog.name, entity=dialog.entity,
+            chosen_exts=frozenset(formats), all_formats=all_formats,
+            output_dir=self.config["output_dir"])
 
-        self.chosen_exts = set(chosen_exts)
-        self.all_formats_mode = all_formats or ("*" in chosen_exts) or (len(chosen_exts) == 0)
-
-        logger.info("Enqueueing %d chats. exts=%s all_formats=%s",
-                    len(selected_dialogs), chosen_exts, self.all_formats_mode)
-
-        with self.states_lock:
-            for d in selected_dialogs:
-                state = self.pagination_states.get(d.id)
-                if not state:
-                    state = ChatPaginationState(chat_id=d.id, chat_name=d.name, entity=d.entity)
-                    self.pagination_states[d.id] = state
-                else:
-                    state.entity = d.entity
-                    state.last_msg_id = 0
-                    state.has_more = True
-                    state.fetching_in_progress = False
-                    state.consecutive_errors = 0
-
-        self.emit_event("queue_updated", None)
-        for d in selected_dialogs:
-            self._spawn(self._fetch_next_chat_batch(d.id))
-
-    async def _fetch_next_chat_batch(self, chat_id: int):
-        """Fetches the next batch of matching files for one chat."""
-        with self.states_lock:
-            state = self.pagination_states.get(chat_id)
-            if not state or state.fetching_in_progress or not state.has_more:
-                logger.debug("Fetch skipped for %s (exists=%s fetching=%s has_more=%s)", chat_id,
-                             state is not None,
-                             state.fetching_in_progress if state else None,
-                             state.has_more if state else None)
-                return
-            state.fetching_in_progress = True
-            state.retry_armed = False
-
-        new_items: List[DownloadItem] = []
-        failed = False
-        try:
-            logger.debug("Fetching batch for '%s' (%s), offset_id=%s",
-                         state.chat_name, chat_id, state.last_msg_id)
-            fetched_matching = 0
-            scanned = 0
-
-            kwargs: Dict[str, Any] = {"limit": MESSAGE_SCAN_WINDOW}
-            if state.last_msg_id > 0:
-                kwargs["offset_id"] = state.last_msg_id
-
-            target_entity = state.entity if state.entity is not None else chat_id
-
-            async for msg in self.client.iter_messages(target_entity, **kwargs):
-                state.last_msg_id = msg.id
-                scanned += 1
-
-                if not msg.file:
-                    continue
-
-                ext = (msg.file.ext or "").lower()
-                if not (self.all_formats_mode or ext in self.chosen_exts):
-                    continue
-
-                item_id = f"{chat_id}_{msg.id}"
-                with self.queue_lock:
-                    if item_id in self.queue_index:
-                        continue
-
-                new_items.append(DownloadItem(
-                    id=item_id,
-                    chat_id=chat_id,
-                    chat_name=state.chat_name,
-                    message=msg,
-                    file_name=sanitize_file_name(msg.file.name, msg.id, ext),
-                    msg_id=msg.id,
-                    ext=ext,
-                    file_size=msg.file.size,
-                ))
-                fetched_matching += 1
-                if fetched_matching >= TARGET_BATCH_SIZE:
-                    break
-
-            logger.info("Batch for '%s': scanned %d, queued %d new.",
-                        state.chat_name, scanned, len(new_items))
-
-            if scanned < MESSAGE_SCAN_WINDOW and fetched_matching < TARGET_BATCH_SIZE:
-                state.has_more = False
-                logger.info("Reached end of history for '%s'.", state.chat_name)
-
-            if new_items:
-                with self.queue_lock:
-                    for item in new_items:
-                        self.download_queue.append(item)
-                        self.queue_index[item.id] = item
-                with self.states_lock:
-                    state.total_discovered += len(new_items)
-                self.emit_event("queue_updated", None)
-
-            state.consecutive_errors = 0
-            self._schedule_downloads()
-
-        except asyncio.CancelledError:
-            raise
-        except (errors.UnauthorizedError, errors.AuthKeyError):
-            await self.session_invalid()
-        except errors.FloodError as e:
-            failed = True
-            wait = getattr(e, "seconds", 0) or 0
-            logger.warning("Rate limited fetching '%s': %ss", state.chat_name, wait)
-            self._enter_flood_wait(wait)
-        except Exception as e:
-            failed = True
-            logger.exception("Error fetching batch for '%s' (%s): %s", state.chat_name, chat_id, e)
-        finally:
-            with self.states_lock:
-                state.fetching_in_progress = False
-            if failed:
-                self._arm_fetch_retry(chat_id)
-            else:
-                self._check_and_trigger_next_batch(chat_id)
-
-    def _arm_fetch_retry(self, chat_id: int):
-        """Backs off after a failed batch fetch.
-
-        Previously the finally-block re-triggered the fetch immediately, so a
-        persistent failure (revoked access, network down) became an unbounded
-        zero-delay retry loop that hammered the API and flooded the log.
-        """
-        with self.states_lock:
-            state = self.pagination_states.get(chat_id)
-            if not state or state.retry_armed:
-                return
-            state.consecutive_errors += 1
-            attempt = state.consecutive_errors
-            if attempt > len(FETCH_BACKOFF):
-                state.has_more = False
-                logger.error("Giving up on '%s' after %d consecutive fetch failures.",
-                             state.chat_name, attempt)
-                self.report_error(
-                    f"Stopped scanning '{state.chat_name}' after {attempt} failures."
-                )
-                return
-            delay = FETCH_BACKOFF[attempt - 1]
-            state.retry_armed = True
-            name = state.chat_name
-
-        logger.info("Retrying '%s' in %ss (attempt %d).", name, delay, attempt)
-
-        generation = self._account_generation
-        self._call_on_loop(
-            lambda: self.loop.call_later(
-                delay, lambda: self._spawn(self._fetch_next_chat_batch(chat_id))
-                if generation == self._account_generation else None)
-        )
-
-    def _check_and_trigger_next_batch(self, chat_id: int):
-        """Fetches the next batch when a chat's pending queue runs low."""
-        try:
-            with self.states_lock:
-                state = self.pagination_states.get(chat_id)
-                if not state or not state.has_more or state.fetching_in_progress:
-                    return
-                name = state.chat_name
-
-            with self.queue_lock:
-                pending = sum(
-                    1 for it in self.download_queue
-                    if it.chat_id == chat_id and it.status in ("Queued", "Downloading")
-                )
-
-            if pending < QUEUE_REFILL_THRESHOLD:
-                logger.debug("Queue low for '%s' (%d pending); fetching next batch.", name, pending)
-                self._spawn(self._fetch_next_chat_batch(chat_id))
-        except Exception as e:
-            logger.exception("Error in _check_and_trigger_next_batch(%s): %s", chat_id, e)
-
-    # ---------------------------------------------------------------- scheduling
-
-    def _enter_flood_wait(self, seconds: int):
-        """Pauses all dispatch until the rate limit expires."""
-        seconds = max(1, int(seconds or 1))
-        deadline = time.monotonic() + seconds
-        if deadline <= self.flood_until:
-            return
-        self.flood_until = deadline
-        logger.warning("Rate limited by Telegram; pausing downloads for %ss.", seconds)
-        self.emit_event("flood_wait", seconds)
-        self._arm_flood_timer()
-
-    def _arm_flood_timer(self):
-        if self._flood_timer_armed:
-            return
-        self._flood_timer_armed = True
-        delay = max(0.5, self.flood_until - time.monotonic() + 0.5)
-
-        generation = self._account_generation
-
-        def _clear():
-            if generation != self._account_generation:
-                return
-            self._flood_timer_armed = False
-            if time.monotonic() >= self.flood_until:
-                logger.info("Rate limit expired; resuming downloads.")
-                self.emit_event("flood_cleared", None)
-                self._schedule_downloads()
-            else:
-                self._arm_flood_timer()
-
-        if not self._call_on_loop(lambda: self.loop.call_later(delay, _clear)):
-            self._flood_timer_armed = False
-
-    def _schedule_downloads(self):
-        """Dispatches queued items using fair round-robin across active chats."""
-        try:
-            if self._shutting_down or self._account_resetting:
-                return
-            if time.monotonic() < self.flood_until:
-                self._arm_flood_timer()
-                return
-
-            to_start: List[DownloadItem] = []
-            with self.queue_lock:
-                active = sum(1 for it in self.download_queue if it.status == "Downloading")
-                max_parallel = self.config.get("max_parallel_files", 3)
-                slots = max_parallel - active
-                if slots <= 0:
-                    return
-
-                # Bucket once, then round-robin out of the buckets. The previous
-                # version rebuilt this map from the whole queue for every slot.
-                queued_by_chat: Dict[int, List[DownloadItem]] = {}
-                for it in self.download_queue:
-                    if it.status == "Queued":
-                        queued_by_chat.setdefault(it.chat_id, []).append(it)
-                if not queued_by_chat:
-                    return
-
-                chat_ids = list(queued_by_chat.keys())
-                if self.last_dispatched_chat_id in chat_ids:
-                    cursor = chat_ids.index(self.last_dispatched_chat_id)
-                else:
-                    cursor = -1
-
-                while slots > 0 and chat_ids:
-                    cursor = (cursor + 1) % len(chat_ids)
-                    chat_id = chat_ids[cursor]
-                    bucket = queued_by_chat[chat_id]
-                    item = bucket.pop(0)
-                    if not bucket:
-                        chat_ids.pop(cursor)
-                        cursor -= 1
-                    item.status = "Downloading"
-                    self.last_dispatched_chat_id = chat_id
-                    to_start.append(item)
-                    slots -= 1
-
-            logger.debug("Dispatching %d download(s); %d active.", len(to_start), active)
-            for item in to_start:
-                self._spawn(self._download_worker(item), owner=item)
-                self.emit_event("item_updated", item)
-        except Exception as e:
-            logger.exception("Error in _schedule_downloads: %s", e)
+    def _make_download_item(self, state, message, ext):
+        return DownloadItem(
+            id=f"{state.chat_id}_{message.id}", chat_id=state.chat_id,
+            chat_name=state.chat_name, message=message,
+            file_name=sanitize_file_name(message.file.name, message.id, ext),
+            msg_id=message.id, ext=ext, file_size=message.file.size,
+            output_dir=state.output_dir)
 
     # ------------------------------------------------------------------ download
 
-    def _resolve_paths(self, item: DownloadItem) -> Tuple[str, str, str]:
+    def _resolve_paths(self, item: DownloadItem) -> tuple[str, str, str]:
         """Returns (output_root, save_dir, save_path), all guaranteed inside output_root."""
-        root = os.path.abspath(self.config["output_dir"])
+        root = os.path.abspath(item.output_dir or self.config["output_dir"])
         chat_dir = sanitize_chat_dir(item.chat_name, item.chat_id)
         save_dir = os.path.join(root, chat_dir)
         save_path = os.path.join(save_dir, item.file_name)
@@ -901,141 +765,139 @@ class TelegramBackend(AuthenticationMixin):
             raise ValueError(f"Refusing to write outside the download folder: {save_path!r}")
         return root, save_dir, save_path
 
-    def _pick_free_path(self, save_path: str) -> str:
-        """Finds a non-colliding variant instead of deleting an existing file."""
-        stem, ext = os.path.splitext(save_path)
-        for n in range(2, 1000):
-            candidate = f"{stem} ({n}){ext}"
-            if not os.path.exists(candidate):
-                return candidate
-        return f"{stem} ({int(time.time())}){ext}"
-
-    async def _download_worker(self, item: DownloadItem):
-        """Downloads one file. Every path out of here leaves a terminal status."""
-        temp_path: Optional[str] = None
+    async def _disk_operation(self, operation, *args):
+        """Drain disk work before cancellation can release its file ownership."""
+        task = asyncio.create_task(asyncio.to_thread(operation, *args))
         try:
-            # NOTE: all of this used to sit outside the try. An exception here
-            # (unwritable dir, bad name) left the item stuck "Downloading"
-            # forever, permanently consuming one parallel slot, silently.
-            root, save_dir, save_path = self._resolve_paths(item)
-            os.makedirs(save_dir, exist_ok=True)
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await self._drain_disk_task(task)
+            raise
 
-            logger.debug("Worker start: '%s' (%s) in '%s'",
-                         item.file_name, human_size(item.file_size or 0), item.chat_name)
+    @staticmethod
+    async def _drain_disk_task(task):
+        # A second Stop/account-switch/shutdown request must not abandon the
+        # underlying thread while it still owns a file or reservation.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        return task.result()
 
-            if item.status == "Cancelled":
-                logger.info("'%s' was cancelled before starting.", item.file_name)
+    async def _download_worker(self, item: DownloadItem, generation=None):
+        """Transfer a reserved media identity without blocking the event loop."""
+        generation = getattr(item, "worker_generation", 0) if generation is None else generation
+        storage = reservation = None
+
+        def owns_item():
+            return generation == getattr(item, "worker_generation", 0)
+
+        try:
+            if not owns_item() or item.status in ("Cancelled", "Paused"):
                 return
-
-            # Existing complete file -> skip. Keeps prior downloads valid.
-            if os.path.exists(save_path):
-                existing = os.path.getsize(save_path)
-                if item.file_size is not None and existing == item.file_size:
-                    logger.debug("Skipping '%s' - already on disk (%d bytes).", item.file_name, existing)
-                    item.status = "Skipped (Exists)"
-                    item.progress = 1.0
-                    return
-                if item.file_size is None and existing > 0:
-                    item.status = "Skipped (Exists)"
-                    item.progress = 1.0
-                    return
-                # Different file sharing a name: never delete the existing one.
-                save_path = self._pick_free_path(save_path)
-                logger.info("Name collision for '%s'; saving as '%s'.",
-                            item.file_name, os.path.basename(save_path))
-
-            # Per-message temp name: a shared "<name>.part" let two workers write
-            # the same file and both report Completed.
-            temp_path = os.path.join(save_dir, f".{item.chat_id}_{item.msg_id}.part")
-
-            await self._transfer(item, temp_path, save_path)
-
-            if not os.path.exists(temp_path):
-                raise IOError("download produced no file")
-
-            written = os.path.getsize(temp_path)
-            if written == 0:
-                raise IOError("download produced an empty file")
-            if item.file_size is not None and written != item.file_size:
-                # Not fatal: msg.file.size is an estimate for progressive photos,
-                # so a mismatch here does not mean the file is truncated. The
-                # resume path, where the byte accounting is ours, checks strictly.
-                logger.warning("'%s': expected %s, wrote %s.", item.file_name,
-                               human_size(item.file_size), human_size(written))
-
-            os.replace(temp_path, save_path)
-            temp_path = None
+            item.last_error = ""
+            root, _, _ = await self._disk_operation(self._resolve_paths, item)
+            account = (f"user:{self.current_user_id}" if getattr(self, "current_user_id", None)
+                       else f"profile:{self.profile_id}" if getattr(self, "profile_id", None)
+                       else f"session:{os.path.abspath(self.session_path)}")
+            identity = media_identity(account, item)
+            storage = await self._disk_operation(get_storage, root)
+            prepare = asyncio.create_task(asyncio.to_thread(
+                storage.prepare, account, item.chat_id, sanitize_chat_dir(item.chat_name, item.chat_id),
+                item.file_name, identity))
+            try:
+                reservation = await asyncio.shield(prepare)
+            except asyncio.CancelledError:
+                reservation = await self._drain_disk_task(prepare)
+                raise
+            if not owns_item() or item.status in ("Cancelled", "Paused"):
+                raise asyncio.CancelledError()
+            item.output_path = reservation.save_path
+            if reservation.complete:
+                item.status = "Skipped (Exists)"
+                item.progress = 1.0
+                item.downloaded_bytes = reservation.written
+                item.message = None
+                return
+            await self._transfer(item, reservation.temp_path, reservation.save_path)
+            if not owns_item() or item.status in ("Cancelled", "Paused"):
+                raise asyncio.CancelledError()
+            save_path, written = await self._disk_operation(storage.finalize, reservation)
+            if not owns_item():
+                return
+            item.output_path = save_path
             item.status = "Completed"
             item.progress = 1.0
             item.downloaded_bytes = written
+            item.message = None
             logger.debug("Downloaded '%s' -> '%s'", item.file_name, save_path)
-
         except asyncio.CancelledError:
-            item.status = "Cancelled"
-            logger.info("Cancelled '%s'.", item.file_name)
-            self._discard_temp(temp_path)
+            if owns_item():
+                item.status = "Paused" if getattr(item, "_pause_requested", False) else "Cancelled"
+            logger.info("Stopped '%s'; resumable bytes retained.", item.file_name)
             raise
         except errors.FloodError as e:
             wait = getattr(e, "seconds", 0) or 0
-            self._discard_temp(temp_path)
-            self._enter_flood_wait(wait)
-            # Requeue rather than dead-end: the old code left a permanent
-            # "Rate Limited" row that could never run, clear, or re-enqueue.
-            if item.retries < MAX_ITEM_RETRIES:
+            if owns_item():
+                item.last_error = f"Telegram rate limit: retry after {wait} seconds."
+                self._enter_flood_wait(wait)
+            if owns_item() and item.retries < MAX_ITEM_RETRIES:
                 item.retries += 1
                 item.status = "Queued"
-                item.progress = 0.0
-                item.downloaded_bytes = 0
-            else:
+            elif owns_item():
                 item.status = "Failed (rate limit)"
         except errors.FileReferenceExpiredError:
-            self._discard_temp(temp_path)
-            if item.retries < MAX_ITEM_RETRIES and await self._refresh_reference(item):
+            if owns_item():
+                item.last_error = "Telegram file reference expired; refreshing the message."
+            if owns_item() and item.retries < MAX_ITEM_RETRIES and await self._refresh_reference(item):
                 item.retries += 1
                 item.status = "Queued"
-            else:
+            elif owns_item():
                 item.status = "Failed (stale reference)"
         except (errors.UnauthorizedError, errors.AuthKeyError):
-            self._discard_temp(temp_path)
-            item.status = "Cancelled"
-            await self.session_invalid()
-        except (errors.RPCError, OSError, IOError) as e:
-            self._discard_temp(temp_path)
+            if owns_item():
+                item.last_error = "Telegram session is no longer authorized. Sign in again."
+                item.status = "Cancelled"
+                await self.session_invalid()
+        except (errors.RPCError, OSError) as e:
             logger.warning("Download of '%s' failed: %s", item.file_name, e)
-            if item.retries < MAX_ITEM_RETRIES:
+            if owns_item():
+                item.last_error = str(e)
+            if owns_item() and item.retries < MAX_ITEM_RETRIES:
                 item.retries += 1
                 item.status = "Queued"
-                item.progress = 0.0
-                item.downloaded_bytes = 0
-            else:
+            elif owns_item():
                 item.status = "Failed"
                 self.report_error(f"Could not download '{item.file_name}': {e}")
-        except Exception as e:
-            self._discard_temp(temp_path)
-            logger.exception("Unexpected failure downloading '%s': %s", item.file_name, e)
-            item.status = "Failed"
-            self.report_error(f"Could not download '{item.file_name}': {e}")
-        finally:
-            if item.status == "Downloading":
-                # Belt and braces: never leave a slot consumed.
+        except Exception as e:  # noqa: BLE001 - surface unexpected failures without stranding a worker
+            logger.exception("Unexpected failure downloading '%s'", item.file_name)
+            if owns_item():
+                item.last_error = str(e)
                 item.status = "Failed"
-            if item.status in ("Completed", "Skipped (Exists)"):
-                with self.states_lock:
-                    state = self.pagination_states.get(item.chat_id)
-                    if state:
-                        state.total_completed += 1
-            item.task = None
-            self.emit_event("item_updated", item)
-            self._check_and_trigger_next_batch(item.chat_id)
-            self._schedule_downloads()
-
-    @staticmethod
-    def _discard_temp(temp_path: Optional[str]):
-        if temp_path and os.path.exists(temp_path):
-            try:
-                os.remove(temp_path)
-            except OSError as e:
-                logger.debug("Could not remove temp file %s: %s", temp_path, e)
+                self.report_error(f"Could not download '{item.file_name}': {e}")
+        finally:
+            if reservation is not None and storage is not None:
+                try:
+                    if owns_item() and item.status not in ("Completed", "Skipped (Exists)"):
+                        item.downloaded_bytes = await self._disk_operation(storage.partial_bytes, reservation)
+                        item.progress = min(1.0, item.downloaded_bytes / item.file_size) if item.file_size else 0.0
+                finally:
+                    await self._disk_operation(storage.release, reservation)
+            if owns_item():
+                item.speed = 0.0
+                if item.status == "Downloading":
+                    item.status = "Failed"
+                if item.status in ("Completed", "Skipped (Exists)"):
+                    with self.states_lock:
+                        state = self.pagination_states.get(item.chat_id)
+                        if state:
+                            state.total_completed += 1
+                if item.task is asyncio.current_task():
+                    item.task = None
+                self.emit_event("item_updated", item)
+                self._check_and_trigger_next_batch(item.chat_id)
+                self._schedule_downloads()
 
     async def _refresh_reference(self, item: DownloadItem) -> bool:
         """Re-fetches a message whose file reference expired during a long run."""
@@ -1046,9 +908,12 @@ class TelegramBackend(AuthenticationMixin):
             fresh = await self.client.get_messages(entity, ids=item.msg_id)
             if fresh and fresh.file:
                 item.message = fresh
+                item.file_size = fresh.file.size
+                item.ext = (fresh.file.ext or "").lower()
+                item.file_name = sanitize_file_name(fresh.file.name, item.msg_id, item.ext)
                 logger.info("Refreshed stale file reference for '%s'.", item.file_name)
                 return True
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - a failed refresh should become a recoverable row error
             logger.warning("Could not refresh reference for '%s': %s", item.file_name, e)
         return False
 
@@ -1056,9 +921,11 @@ class TelegramBackend(AuthenticationMixin):
         """Progress callback throttled to ~10 Hz so the UI queue cannot be swamped."""
         item.last_update_time = time.monotonic()
         item.last_bytes = item.downloaded_bytes
+        generation = getattr(item, "worker_generation", 0)
 
         def progress_cb(current, total):
-            if item.status == "Cancelled":
+            if (item.status in ("Cancelled", "Paused")
+                    or generation != getattr(item, "worker_generation", 0)):
                 return
             now = time.monotonic()
             elapsed = now - item.last_update_time
@@ -1074,156 +941,74 @@ class TelegramBackend(AuthenticationMixin):
         return progress_cb
 
     async def _transfer(self, item: DownloadItem, temp_path: str, save_path: str):
-        """Downloads the file, resuming from a partial .part when one is usable."""
+        """Resume only manifest-owned documents; photo sizes may be estimates."""
         progress_cb = self._make_progress_cb(item)
+        exact_size = media_identity("transfer", item).exact_size
 
-        resume_from = 0
-        if os.path.exists(temp_path) and item.file_size:
-            existing = os.path.getsize(temp_path)
-            aligned = (min(existing, item.file_size) // RESUME_ALIGN) * RESUME_ALIGN
-            if aligned > 0 and aligned < item.file_size:
-                resume_from = aligned
+        def partial_size():
+            return os.path.getsize(temp_path) if os.path.isfile(temp_path) else 0
 
+        existing = await self._disk_operation(partial_size)
+        if exact_size and item.file_size and existing == item.file_size:
+            return
+        resume_from = ((existing // RESUME_ALIGN) * RESUME_ALIGN
+                       if exact_size and item.file_size and existing < item.file_size else 0)
         if resume_from:
             try:
                 logger.info("Resuming '%s' at %s.", item.file_name, human_size(resume_from))
                 await self._download_resumed(item, temp_path, resume_from, progress_cb)
                 return
-            except (asyncio.CancelledError, errors.FloodError, errors.FileReferenceExpiredError):
-                raise
-            except Exception as e:
-                # An earlier iteration of this app broke on chunked downloads;
-                # if resume misbehaves for any reason, start over rather than fail.
-                logger.warning("Resume failed for '%s' (%s); restarting from scratch.",
+            except (AttributeError, TypeError, NotImplementedError, IncompleteDownloadError) as e:
+                # Unsupported streams or a normal EOF before the advertised end
+                # can restart once through Telethon's normal downloader. Network
+                # exceptions retain the partial and retry the aligned stream.
+                logger.warning("Resume could not complete for '%s' (%s); restarting from scratch.",
                                item.file_name, e)
-                self._discard_temp(temp_path)
                 item.downloaded_bytes = 0
                 item.progress = 0.0
                 progress_cb = self._make_progress_cb(item)
-
-        await self.client.download_media(item.message, file=temp_path, progress_callback=progress_cb)
+        sink = await AsyncDiskSink.open(temp_path)
+        try:
+            await self.client.download_media(item.message, file=sink, progress_callback=progress_cb)
+        finally:
+            await sink.finish()
 
     async def _download_resumed(self, item: DownloadItem, temp_path: str,
                                 resume_from: int, progress_cb):
-        """Appends to an existing .part using a byte-offset chunk stream."""
+        """Append aligned chunks; all local file operations stay off this loop."""
         total = item.file_size or 0
         downloaded = resume_from
         item.downloaded_bytes = downloaded
-        with open(temp_path, "r+b") as fh:
-            fh.truncate(resume_from)
-            fh.seek(resume_from)
+        sink = await AsyncDiskSink.open(temp_path, resume_from)
+        try:
             async for chunk in self.client.iter_download(
                 item.message, offset=resume_from, request_size=RESUME_ALIGN
             ):
-                if item.status == "Cancelled":
+                if item.status in ("Cancelled", "Paused"):
                     raise asyncio.CancelledError()
-                fh.write(chunk)
+                await sink.write(chunk)
                 downloaded += len(chunk)
                 progress_cb(downloaded, total or downloaded)
-            fh.flush()
-            os.fsync(fh.fileno())
-
-        # Strict here on purpose: these bytes were appended by us, so a short
-        # result is a real truncation. _transfer turns this into a clean restart.
+        finally:
+            await sink.finish()
         if total and downloaded != total:
-            raise IOError(f"resume wrote {downloaded} of {total} bytes")
+            raise IncompleteDownloadError(f"resume wrote {downloaded} of {total} bytes")
 
     # ------------------------------------------------------------------ actions
 
-    def cancel_download(self, item_id: str):
-        """Cancels an active or queued item."""
-        with self.queue_lock:
-            item = self.queue_index.get(item_id)
-            if not item or item.status in _TERMINAL_STATUSES:
-                return
-            task = item.task
-            item.status = "Cancelled"
-        if task is not None:
-            self._call_on_loop(task.cancel)
-        logger.info("Cancelled '%s' by user.", item.file_name)
-        self.emit_event("item_updated", item)
-        self._schedule_downloads()
-
-    def cancel_all(self, exclude_task=None):
-        """Cancels everything still pending or in flight."""
-        tasks = []
-        with self.queue_lock:
-            for item in self.download_queue:
-                if item.status in ("Queued", "Downloading"):
-                    if item.task is not None and item.task is not exclude_task:
-                        tasks.append(item.task)
-                    item.status = "Cancelled"
-        with self.states_lock:
-            for state in self.pagination_states.values():
-                state.has_more = False
-        for task in tasks:
-            self._call_on_loop(task.cancel)
-        logger.info("Cancelled all pending downloads (%d in flight).", len(tasks))
-        self.emit_event("queue_updated", None)
-
-    def retry_failed(self) -> int:
-        """Requeues every failed or cancelled item."""
-        count = 0
-        with self.queue_lock:
-            for item in self.download_queue:
-                if item.status.startswith("Failed") or item.status == "Cancelled":
-                    item.status = "Queued"
-                    item.retries = 0
-                    item.progress = 0.0
-                    item.downloaded_bytes = 0
-                    item.speed = 0.0
-                    count += 1
-        if count:
-            logger.info("Requeued %d failed/cancelled item(s).", count)
-            self.emit_event("queue_updated", None)
-            self._schedule_downloads()
-        return count
-
-    def clear_completed(self) -> int:
-        """Drops every terminal item from memory, freeing retained Message objects."""
-        with self.queue_lock:
-            keep = [it for it in self.download_queue if it.status not in _TERMINAL_STATUSES]
-            removed = len(self.download_queue) - len(keep)
-            self.download_queue = keep
-            self.queue_index = {it.id: it for it in keep}
-        logger.info("Cleared %d finished item(s) from the queue.", removed)
-        self.emit_event("queue_updated", None)
-        return removed
-
-    def sweep_orphan_parts(self) -> Tuple[int, int]:
-        """Counts leftover .part files from previous runs. Returns (count, bytes)."""
-        root = self.config.get("output_dir", "")
-        count = total = 0
+    def sweep_orphan_parts(self, output_dir=None) -> tuple[int, int]:
+        """Count unowned fragments. GUI callers must dispatch this off the Tk thread."""
+        root = self.config.get("output_dir", "") if output_dir is None else output_dir
         if not os.path.isdir(root):
             return 0, 0
-        for dirpath, _dirnames, filenames in os.walk(root):
-            for name in filenames:
-                if name.endswith(".part"):
-                    try:
-                        total += os.path.getsize(os.path.join(dirpath, name))
-                        count += 1
-                    except OSError:
-                        pass
-        return count, total
+        return get_storage(root).orphan_parts()
 
-    def delete_orphan_parts(self) -> Tuple[int, int]:
-        """Deletes leftover .part files. Returns (count, bytes) actually removed."""
-        root = self.config.get("output_dir", "")
-        count = total = 0
+    def delete_orphan_parts(self, output_dir=None) -> tuple[int, int]:
+        """Delete unowned fragments while retaining active and resumable files."""
+        root = self.config.get("output_dir", "") if output_dir is None else output_dir
         if not os.path.isdir(root):
             return 0, 0
-        for dirpath, _dirnames, filenames in os.walk(root):
-            for name in filenames:
-                if not name.endswith(".part"):
-                    continue
-                path = os.path.join(dirpath, name)
-                try:
-                    size = os.path.getsize(path)
-                    os.remove(path)
-                    count += 1
-                    total += size
-                except OSError as e:
-                    logger.warning("Could not remove %s: %s", path, e)
+        count, total = get_storage(root).orphan_parts(delete=True)
         logger.info("Removed %d orphaned .part file(s), %s.", count, human_size(total))
         return count, total
 
@@ -1234,6 +1019,7 @@ class TelegramBackend(AuthenticationMixin):
         self._shutting_down = True
 
         async def drain():
+            await self._reset_scheduler()
             pending = list(self._pending_tasks)
             for task in pending:
                 task.cancel()
@@ -1251,8 +1037,8 @@ class TelegramBackend(AuthenticationMixin):
             self.thread.join(timeout=timeout)
 
 
-# Number of reusable row widgets kept alive in the queue view. Rendering cost is
-# bound to this, not to the queue length.
+# Maximum reusable rows. The actual visible count follows viewport size;
+# allocating a pool must never imply that every row fits on screen.
 ROW_POOL_SIZE = 40
 
 # Same idea for the chat picker. An account with a few hundred dialogs used to
@@ -1269,6 +1055,7 @@ class App(ctk.CTk):
         super().__init__()
         self.title("Telegram Multi-Chat Stream Downloader")
         self.geometry("1150x760")
+        self.minsize(880, 600)
         ctk.set_appearance_mode("Dark")
 
         self.backend = backend
@@ -1280,6 +1067,20 @@ class App(ctk.CTk):
         self.selected_chat_ids: Set[int] = set()
         self.chat_rows: List[Dict[str, Any]] = []
         self.chat_offset = 0
+        self.chat_visible_count = 1
+        self.queue_visible_count = 1
+        self.chat_focus_index = 0
+        self.queue_focus_index = 0
+        self._resize_jobs = {}
+        self._scan_request = None
+        self._scan_busy = False
+        self._scan_serial = 0
+        self._errors = []
+        self._background_callbacks = {}
+        self._background_serial = 0
+        self._starting_downloads = False
+        self._saving_settings = False
+        self.current_page = "groups"
         self.kind_filter_boxes: Dict[str, ctk.CTkCheckBox] = {}
         self.show_archived_box: Optional[ctk.CTkCheckBox] = None
 
@@ -1307,41 +1108,36 @@ class App(ctk.CTk):
     # ------------------------------------------------------------------ plumbing
 
     def _poll_queue(self):
-        """Drains backend events on the Tk thread, coalescing progress updates."""
-        max_events_per_tick = 200
-        processed = 0
-        progress_updates: Dict[str, DownloadItem] = {}
-        other_events: List[Tuple[str, Any]] = []
-
+        """Keep each notification turn short enough for input/paint events to run."""
+        if getattr(self, "_closing", False):
+            return
+        deadline = time.perf_counter() + 0.008
         try:
-            while processed < max_events_per_tick:
+            while time.perf_counter() < deadline:
                 try:
                     event_type, data = self.backend.event_queue.get_nowait()
                 except queue.Empty:
                     break
-                processed += 1
-                if event_type == "item_progress" and isinstance(data, DownloadItem):
-                    progress_updates[data.id] = data
-                else:
-                    other_events.append((event_type, data))
-
-            for event_type, data in other_events:
-                # Isolated so one bad event cannot discard the rest of the tick.
                 try:
-                    self._process_ui_update(event_type, data)
+                    if event_type == "item_progress" and isinstance(data, DownloadItem):
+                        if self.current_page == "queue":
+                            self.update_single_item_progress(data)
+                    else:
+                        self._process_ui_update(event_type, data)
                 except Exception as e:
                     logger.exception("Error handling UI event %r: %s", event_type, e)
-
-            for item in progress_updates.values():
-                self.update_single_item_progress(item)
         except Exception as e:
             logger.exception("Error in UI poll loop: %s", e)
         finally:
-            self.after(50, self._poll_queue)
+            self.after(16 if not self.backend.event_queue.empty() else 50, self._poll_queue)
 
     def _tick_refresh(self):
         """Coalesced repaint. Keeps per-event work off the hot path."""
+        if getattr(self, "_closing", False):
+            return
         try:
+            if self.current_page != "queue":
+                return
             if self._queue_dirty:
                 self._queue_dirty = False
                 self._render_queue_window()
@@ -1355,6 +1151,8 @@ class App(ctk.CTk):
             self.after(400, self._tick_refresh)
 
     def _process_ui_update(self, event_type: str, data: Any):
+        if getattr(self, "_closing", False):
+            return
         if event_type == "login_state":
             self.page_accounts.handle(data)
             self.set_status(data["message"])
@@ -1366,12 +1164,30 @@ class App(ctk.CTk):
             self.page_accounts.show_profile(data)
         elif event_type == "account_reset":
             self.page_accounts.reset_profile()
+            self._background_callbacks.clear()
+            self._starting_downloads = False
+            self._saving_settings = False
+            self._scan_request = None
+            self._scan_busy = False
+            self._set_scan_busy(False)
+            self.start_button.configure(state="normal")
+            self.save_settings_button.configure(state="normal")
             self.all_chats.clear()
             self.filtered_chats.clear()
             self.selected_chat_ids.clear()
             self.active_group_filter = None
             self.chat_offset = self.queue_offset = 0
             self._flood_notice = ""
+            self.search_chat_var.set("")
+            self.search_queue_group_var.set("")
+            self.selected_only_var.set(False)
+            self.format_mode.set("all")
+            self.dismiss_errors()
+            for widget in self.group_widgets.values():
+                widget.destroy()
+            self.group_widgets.clear()
+            self.queue_header.configure(text="Download Queue: All chats")
+            self._update_chat_action_buttons()
             self.on_filter_chats()
             self.populate_scanned_extensions()
             self._queue_dirty = self._sidebar_dirty = True
@@ -1399,8 +1215,22 @@ class App(ctk.CTk):
             groups = sum(1 for e in self.all_chats if e.kind in ("Group", "Channel"))
             self.set_status(f"Loaded {len(self.all_chats)} chats "
                             f"({groups} groups/channels).")
-        elif event_type == "scan_progress":
-            self.set_status(str(data))
+        elif event_type in ("scan_started", "scan_progress", "scan_finished"):
+            if isinstance(data, dict):
+                if data.get("generation") != self._scan_request:
+                    return
+                self.scan_status.configure(text=data.get("message", ""))
+                self.set_status(data.get("message", ""))
+                if event_type == "scan_finished":
+                    self._set_scan_busy(False)
+                    if data.get("status") in ("complete", "completed", "success", "partial"):
+                        self.populate_scanned_extensions(data.get("extensions", []))
+                        if data.get("status") == "partial":
+                            self.show_error(data.get("message", "Some chats could not be scanned. Scan again to retry."))
+                    elif data.get("status") == "error":
+                        self.show_error(data.get("message", "Scan failed. Try again."))
+            elif event_type == "scan_progress":
+                self.set_status(str(data))
         elif event_type == "extensions_scanned":
             self.populate_scanned_extensions(extra_exts=data)
             self.set_status(f"Scan complete: {len(data or [])} format(s) found.")
@@ -1408,7 +1238,7 @@ class App(ctk.CTk):
             self._queue_dirty = True
             self._sidebar_dirty = True
         elif event_type == "item_updated":
-            if isinstance(data, DownloadItem):
+            if self.current_page == "queue" and isinstance(data, DownloadItem):
                 self.update_single_item_view(data)
             self._sidebar_dirty = True
             self._queue_dirty = True
@@ -1419,10 +1249,73 @@ class App(ctk.CTk):
             self._flood_notice = ""
             self.set_status("Rate limit expired. Resuming downloads.")
         elif event_type == "error":
-            self.set_status(f"⚠️ {data}")
+            self.show_error(str(data))
+        elif event_type == "background_result":
+            request, result, error = data
+            callbacks = self._background_callbacks.pop(request, None)
+            if callbacks is None:
+                return
+            callback, finished = callbacks
+            try:
+                if error:
+                    self.show_error(error)
+                elif callback is not None:
+                    callback(result)
+            finally:
+                if finished is not None:
+                    finished()
+        elif event_type == "action_finished":
+            self.set_status(str(data))
 
     def set_status(self, text: str):
         self.status_label.configure(text=text[:160])
+
+    def show_error(self, text: str):
+        """Keep failures available after subsequent progress replaces the status."""
+        self._errors.append(str(text))
+        self._errors = self._errors[-100:]
+        self.error_label.configure(text=f"{len(self._errors)} issue(s) — {str(text)[:100]}")
+        self.error_bar.grid()
+        self.set_status(str(text))
+
+    def show_error_details(self):
+        self._show_details("Download issues", "\n\n".join(self._errors))
+
+    def dismiss_errors(self):
+        self._errors.clear()
+        self.error_bar.grid_remove()
+        self._enable_keyboard_controls(self)
+
+    def _show_details(self, title, text):
+        window = ctk.CTkToplevel(self)
+        window.title(title)
+        window.geometry("620x360")
+        window.transient(self)
+        box = ctk.CTkTextbox(window, wrap="word")
+        box.pack(fill="both", expand=True, padx=12, pady=12)
+        box.insert("1.0", str(text))
+        box.configure(state="disabled")
+        ctk.CTkButton(window, text="Close", command=window.destroy).pack(pady=(0, 12))
+        window.bind("<Escape>", lambda _event: window.destroy())
+        window.after(50, window.focus_set)
+
+    def _run_background(self, label, fn, on_success=None, on_finished=None):
+        """Only the callable runs in a worker; all widget access stays on Tk."""
+        if getattr(self, "_closing", False):
+            return
+        self._background_serial += 1
+        request = self._background_serial
+        self._background_callbacks[request] = (on_success, on_finished)
+        self.set_status(label)
+
+        async def run():
+            try:
+                result = await asyncio.to_thread(fn)
+            except Exception as exc:
+                self.backend.emit_event("background_result", (request, None, f"{label}: {exc}"))
+            else:
+                self.backend.emit_event("background_result", (request, result, None))
+        self.backend.run_coro(run())
 
     # -------------------------------------------------------------------- layout
 
@@ -1474,7 +1367,17 @@ class App(ctk.CTk):
         # outage looked identical to an idle window.
         self.status_label = ctk.CTkLabel(self, text="Starting up...", anchor="w",
                                          text_color="gray70")
-        self.status_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 8))
+        self.status_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=15, pady=(0, 8))
+        self.error_bar = ctk.CTkFrame(self, fg_color=("#fff0df", "#493321"))
+        self.error_bar.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=4)
+        self.error_bar.grid_columnconfigure(0, weight=1)
+        self.error_label = ctk.CTkLabel(self.error_bar, text="", anchor="w")
+        self.error_label.grid(row=0, column=0, padx=8, sticky="ew")
+        ctk.CTkButton(self.error_bar, text="View issues", width=90,
+                      command=self.show_error_details).grid(row=0, column=1, padx=4, pady=4)
+        ctk.CTkButton(self.error_bar, text="Dismiss", width=75,
+                      command=self.dismiss_errors).grid(row=0, column=2, padx=4, pady=4)
+        self.error_bar.grid_remove()
 
         self.select_page("groups")
 
@@ -1485,7 +1388,7 @@ class App(ctk.CTk):
 
         left_box = ctk.CTkFrame(self.page_groups)
         left_box.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=5, pady=5)
-        left_box.grid_rowconfigure(5, weight=1)
+        left_box.grid_rowconfigure(6, weight=1)
         left_box.grid_columnconfigure(0, weight=1)
 
         ctk.CTkLabel(left_box, text="Step 1: Select Target Chats",
@@ -1524,18 +1427,26 @@ class App(ctk.CTk):
         ctk.CTkButton(action_row, text="Clear", width=60, height=26, fg_color="gray30",
                       command=self.on_clear_chat_selection).grid(row=0, column=1, padx=2)
         self.chat_counts_label = ctk.CTkLabel(action_row, text="No chats loaded yet.",
-                                              anchor="e", text_color="gray70")
-        self.chat_counts_label.grid(row=0, column=2, sticky="ew", padx=(6, 4))
+                                              width=1, height=50, anchor="w", text_color="gray70", wraplength=320)
+        self.chat_counts_label.grid(row=1, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+        self.selected_only_var = ctk.BooleanVar(value=False)
+        ctk.CTkCheckBox(left_box, text="Show selected chats only", variable=self.selected_only_var,
+                        command=self.on_filter_chats).grid(row=5, column=0, padx=10, pady=3, sticky="w")
 
         chat_body = ctk.CTkFrame(left_box, fg_color="transparent")
-        chat_body.grid(row=5, column=0, sticky="nsew", padx=8, pady=5)
+        self.chat_body = chat_body
+        chat_body.grid(row=6, column=0, sticky="nsew", padx=8, pady=5)
+        chat_body.grid_propagate(False)
         chat_body.grid_columnconfigure(0, weight=1)
         chat_body.grid_rowconfigure(CHAT_POOL_SIZE, weight=1)
+        chat_body.bind("<Configure>", lambda _e: self._schedule_list_resize("chat"))
 
         for i in range(CHAT_POOL_SIZE):
             self.chat_rows.append(self._build_chat_row(chat_body, i))
 
-        self.chat_scrollbar = ctk.CTkScrollbar(chat_body, command=self._on_chat_scroll)
+        # CTkScrollbar.set() synchronously flushes every pending Tk paint. Native
+        # scrollbars let the event loop paint after this short list callback.
+        self.chat_scrollbar = ttk.Scrollbar(chat_body, orient="vertical", command=self._on_chat_scroll)
         self.chat_scrollbar.grid(row=0, column=1, rowspan=CHAT_POOL_SIZE + 1,
                                  sticky="ns", padx=(4, 0))
         self.chat_scrollbar.set(0.0, 1.0)
@@ -1550,60 +1461,83 @@ class App(ctk.CTk):
         right_box.grid_rowconfigure(1, weight=1)
         right_box.grid_columnconfigure(0, weight=1)
 
-        ctk.CTkLabel(right_box, text="Step 2: Discovered Formats",
+        ctk.CTkLabel(right_box, text="Step 2: Choose file formats",
                      font=("Arial", 15, "bold")).grid(row=0, column=0, pady=8, padx=10, sticky="w")
+        self.format_mode = ctk.StringVar(value="all")
+        format_modes = ctk.CTkFrame(right_box, fg_color="transparent")
+        format_modes.grid(row=1, column=0, sticky="ew", padx=12, pady=4)
+        ctk.CTkRadioButton(format_modes, text="All files", variable=self.format_mode, value="all",
+                           command=self._update_format_mode).pack(anchor="w", pady=4)
+        ctk.CTkRadioButton(format_modes, text="Selected formats", variable=self.format_mode, value="selected",
+                           command=self._update_format_mode).pack(anchor="w", pady=4)
+        right_box.grid_rowconfigure(1, weight=0)
+        right_box.grid_rowconfigure(2, weight=1)
         self.ext_scroll = ctk.CTkScrollableFrame(right_box)
-        self.ext_scroll.grid(row=1, column=0, sticky="nsew", padx=8, pady=5)
+        self.ext_scroll.grid(row=2, column=0, sticky="nsew", padx=8, pady=5)
 
         self.lbl_ext_placeholder = ctk.CTkLabel(
             self.ext_scroll,
-            text="⭐ ALL Formats selected by default.\n\n"
-                 "Click '🔍 Scan Selected Chats' to discover specific file extensions.",
+            text="All files will be downloaded.\n\n"
+                 "To choose extensions, scan the selected chats first.",
             justify="center",
-            text_color="gray70"
+            text_color="gray70", wraplength=280,
         )
         self.lbl_ext_placeholder.pack(padx=20, pady=40)
+        self.scan_status = ctk.CTkLabel(right_box, text="", anchor="w", wraplength=300)
+        self.scan_status.grid(row=3, column=0, sticky="ew", padx=12, pady=4)
 
         btn_frame = ctk.CTkFrame(self.page_groups)
         btn_frame.grid(row=2, column=0, columnspan=2, sticky="ew", pady=10)
 
-        ctk.CTkButton(btn_frame, text="🔍 Scan Selected Chats",
-                      command=self.on_scan_extensions).pack(side="left", padx=15, pady=8)
-        ctk.CTkButton(btn_frame, text="🚀 Start Downloads", fg_color="green",
-                      command=self.on_start_downloads).pack(side="right", padx=15, pady=8)
+        self.scan_button = ctk.CTkButton(btn_frame, text="Scan selected chats", command=self.on_scan_extensions)
+        self.scan_button.pack(side="left", padx=10, pady=8)
+        self.cancel_scan_button = ctk.CTkButton(btn_frame, text="Cancel scan", width=100,
+                                               state="disabled", command=self.on_cancel_scan)
+        self.cancel_scan_button.pack(side="left", padx=4, pady=8)
+        self.start_button = ctk.CTkButton(btn_frame, text="Add to downloads", fg_color="green",
+                                         command=self.on_start_downloads)
+        self.start_button.pack(side="right", padx=10, pady=8)
 
     def populate_scanned_extensions(self, extra_exts: Optional[List[str]] = None):
         """Populates Step 2 with the formats discovered by a scan."""
+        had_choices = bool(self.ext_checkboxes)
+        previous = {ext for ext, box in self.ext_checkboxes.items() if box.get()}
         for widget in self.ext_scroll.winfo_children():
             widget.destroy()
         self.ext_checkboxes.clear()
 
-        cb_all = ctk.CTkCheckBox(self.ext_scroll, text="⭐ ALL Formats (Any File)",
-                                 font=("Arial", 13, "bold"))
-        cb_all.select()
-        cb_all.pack(anchor="w", padx=5, pady=6)
-        self.ext_checkboxes["*"] = cb_all
-
         scanned_list = sorted(set(extra_exts or []))
         if not scanned_list:
-            ctk.CTkLabel(self.ext_scroll, text="No file extensions found in the scanned messages.",
-                         text_color="gray60").pack(padx=10, pady=10)
+            ctk.CTkLabel(self.ext_scroll, text="Scan chats to discover available file extensions.",
+                         wraplength=260, text_color="gray60").pack(padx=10, pady=10)
             return
 
         for ext in scanned_list:
             cb = ctk.CTkCheckBox(self.ext_scroll, text=ext)
-            cb.select()
+            if not had_choices or ext in previous:
+                cb.select()
             cb.pack(anchor="w", padx=5, pady=4)
+            self._enable_keyboard_widget(cb)
             self.ext_checkboxes[ext] = cb
+        self._update_format_mode()
+
+    def _update_format_mode(self):
+        selective = self.format_mode.get() == "selected"
+        for cb in self.ext_checkboxes.values():
+            cb.configure(state="normal" if selective else "disabled")
+        if selective and not self.ext_checkboxes:
+            self.scan_status.configure(text="Scan your selected chats, then choose at least one format.")
 
     def _build_page_queue(self):
-        self.page_queue.grid_columnconfigure(0, weight=1)
-        self.page_queue.grid_columnconfigure(1, weight=3)
+        self.page_queue.grid_columnconfigure(0, weight=0, minsize=200)
+        self.page_queue.grid_columnconfigure(1, weight=1)
         self.page_queue.grid_rowconfigure(0, weight=1)
 
-        left_panel = ctk.CTkFrame(self.page_queue)
+        left_panel = ctk.CTkFrame(self.page_queue, width=200)
         left_panel.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        ctk.CTkLabel(left_panel, text="Chat Filters", font=("Arial", 14, "bold")).pack(pady=(8, 4))
+        left_panel.grid_propagate(False)
+        left_panel.pack_propagate(False)
+        ctk.CTkLabel(left_panel, text="All downloads", font=("Arial", 14, "bold")).pack(pady=(8, 4))
 
         self.search_queue_group_var = ctk.StringVar()
         self.search_queue_group_var.trace_add("write", lambda *_: self._mark_sidebar_dirty())
@@ -1611,9 +1545,15 @@ class App(ctk.CTk):
                                                      textvariable=self.search_queue_group_var)
         self.entry_queue_group_search.pack(fill="x", padx=10, pady=(0, 4))
 
-        ctk.CTkButton(left_panel, text="🧹 Clear Finished", fg_color="gray30",
+        global_controls = ctk.CTkFrame(left_panel, fg_color="transparent")
+        global_controls.pack(fill="x", padx=8, pady=3)
+        ctk.CTkButton(global_controls, text="Pause all", width=80,
+                      command=lambda: self._control_downloads("pause", all_chats=True)).pack(side="left", padx=2)
+        ctk.CTkButton(global_controls, text="Resume all", width=80,
+                      command=lambda: self._control_downloads("resume", all_chats=True)).pack(side="right", padx=2)
+        ctk.CTkButton(left_panel, text="Clear completed", fg_color="gray30",
                       command=self.on_clear_completed).pack(fill="x", padx=10, pady=3)
-        ctk.CTkButton(left_panel, text="🔁 Retry Failed", fg_color="gray30",
+        ctk.CTkButton(left_panel, text="Retry failed", fg_color="gray30",
                       command=self.on_retry_failed).pack(fill="x", padx=10, pady=3)
         ctk.CTkButton(left_panel, text="🛑 Cancel All", fg_color="gray30",
                       command=self.on_cancel_all).pack(fill="x", padx=10, pady=3)
@@ -1626,15 +1566,24 @@ class App(ctk.CTk):
         right_panel = ctk.CTkFrame(self.page_queue)
         right_panel.grid(row=0, column=1, sticky="nsew", padx=5, pady=5)
         right_panel.grid_columnconfigure(0, weight=1)
-        right_panel.grid_rowconfigure(2, weight=1)
+        right_panel.grid_rowconfigure(3, weight=1)
 
         self.queue_header = ctk.CTkLabel(right_panel, text="Download Queue: ALL Groups",
-                                         font=("Arial", 14, "bold"))
+                                         font=("Arial", 14, "bold"), anchor="w", wraplength=470)
         self.queue_header.grid(row=0, column=0, sticky="w", padx=10, pady=(8, 0))
 
         self.queue_summary = ctk.CTkLabel(right_panel, text="Queue is empty.",
-                                          anchor="w", text_color="gray70")
+                                          anchor="w", justify="left", wraplength=470, text_color="gray70")
         self.queue_summary.grid(row=1, column=0, sticky="ew", padx=10, pady=(2, 6))
+        self.chat_actions = ctk.CTkFrame(right_panel, fg_color="transparent")
+        self.chat_actions.grid(row=2, column=0, sticky="ew", padx=5, pady=(0, 4))
+        self.chat_action_buttons = []
+        for action, label in (("pause", "Pause chat"), ("resume", "Resume"),
+                              ("cancel", "Cancel"), ("retry", "Retry failed")):
+            button = ctk.CTkButton(self.chat_actions, text=label, width=75, state="disabled",
+                                   command=lambda a=action: self._control_downloads(a))
+            button.pack(side="left", padx=3, pady=2)
+            self.chat_action_buttons.append(button)
 
         # A fixed pool of reusable rows replaces the old one-card-per-item
         # CTkScrollableFrame. Building 5 CTk widgets per file made every queued
@@ -1642,15 +1591,18 @@ class App(ctk.CTk):
         # ~313 ms at 1,200 and seconds at this project's ~8,900 files, which is
         # what made multi-group downloads unusable.
         body = ctk.CTkFrame(right_panel, fg_color="transparent")
-        body.grid(row=2, column=0, sticky="nsew", padx=5, pady=(0, 5))
+        self.queue_body = body
+        body.grid(row=3, column=0, sticky="nsew", padx=5, pady=(0, 5))
+        body.grid_propagate(False)
         body.grid_columnconfigure(0, weight=1)
         body.grid_rowconfigure(ROW_POOL_SIZE, weight=1)
+        body.bind("<Configure>", lambda _e: self._schedule_list_resize("queue"))
 
         for i in range(ROW_POOL_SIZE):
             row = self._build_queue_row(body, i)
             self.queue_rows.append(row)
 
-        self.queue_scrollbar = ctk.CTkScrollbar(body, command=self._on_queue_scroll)
+        self.queue_scrollbar = ttk.Scrollbar(body, orient="vertical", command=self._on_queue_scroll)
         self.queue_scrollbar.grid(row=0, column=1, rowspan=ROW_POOL_SIZE + 1,
                                   sticky="ns", padx=(4, 0))
         self.queue_scrollbar.set(0.0, 1.0)
@@ -1668,18 +1620,21 @@ class App(ctk.CTk):
         frame.grid_columnconfigure(0, weight=1)
 
         row: Dict[str, Any] = {"frame": frame, "chat_id": None, "shown": False}
-        cb = ctk.CTkCheckBox(frame, text="", command=lambda r=row: self._on_chat_toggle(r))
-        cb.grid(row=0, column=0, sticky="w", padx=(4, 4), pady=3)
+        cb = ctk.CTkCheckBox(frame, text="", width=1, command=lambda r=row: self._on_chat_toggle(r))
+        cb.grid(row=0, column=0, sticky="ew", padx=(4, 4), pady=3)
         row["cb"] = cb
 
-        kind = ctk.CTkLabel(frame, text="", width=90, anchor="e", text_color="gray60")
+        kind = ctk.CTkLabel(frame, text="", width=64, anchor="e", text_color="gray60")
         kind.grid(row=0, column=1, sticky="e", padx=(4, 6))
         row["kind"] = kind
+        info = ctk.CTkButton(frame, text="Info", width=42, height=24,
+                             command=lambda r=row: self._show_chat_details(r))
+        info.grid(row=0, column=2, padx=2)
+        row["info"] = info
 
-        for widget in (frame, kind):
-            widget.bind("<MouseWheel>", self._on_chat_wheel)
-            widget.bind("<Button-4>", self._on_chat_wheel)
-            widget.bind("<Button-5>", self._on_chat_wheel)
+        for widget in (frame, cb, kind, info):
+            self._bind_list_widget(widget, "chat")
+        cb.bind("<FocusIn>", lambda _e, r=row: self._focus_row("chat", r))
         return row
 
     def _on_chat_toggle(self, row: Dict[str, Any]):
@@ -1690,6 +1645,7 @@ class App(ctk.CTk):
             self.selected_chat_ids.add(chat_id)
         else:
             self.selected_chat_ids.discard(chat_id)
+        self._selection_changed()
         self._update_chat_counts()
 
     def _on_chat_scroll(self, *args):
@@ -1699,7 +1655,7 @@ class App(ctk.CTk):
         if args[0] == "moveto":
             self.chat_offset = int(round(float(args[1]) * total))
         elif args[0] == "scroll":
-            step = CHAT_POOL_SIZE if len(args) > 2 and args[2] == "pages" else 1
+            step = self.chat_visible_count if len(args) > 2 and args[2] == "pages" else 1
             self.chat_offset += int(args[1]) * step
         self._render_chat_window()
 
@@ -1719,22 +1675,22 @@ class App(ctk.CTk):
     def _render_chat_window(self):
         """Repaints the visible chat rows by rebinding the pool. Cost is O(pool)."""
         total = len(self.filtered_chats)
-        max_offset = max(0, total - CHAT_POOL_SIZE)
+        max_offset = max(0, total - self.chat_visible_count)
         self.chat_offset = max(0, min(self.chat_offset, max_offset))
 
         for i, row in enumerate(self.chat_rows):
             idx = self.chat_offset + i
-            if idx < total:
+            if i < self.chat_visible_count and idx < total:
                 entry = self.filtered_chats[idx]
                 row["chat_id"] = entry.id
-                label = entry.name if len(entry.name) <= 42 else entry.name[:39] + "..."
+                label = entry.name if len(entry.name) <= 27 else entry.name[:24] + "..."
                 if row["cb"].cget("text") != label:
                     row["cb"].configure(text=label)
                 # select()/deselect() never fire the row command, so rebinding a
                 # recycled row cannot corrupt the selection set.
-                if entry.id in self.selected_chat_ids:
+                if entry.id in self.selected_chat_ids and not row["cb"].get():
                     row["cb"].select()
-                else:
+                elif entry.id not in self.selected_chat_ids and row["cb"].get():
                     row["cb"].deselect()
                 tag = f"{entry.kind} 📦" if entry.archived else entry.kind
                 if row["kind"].cget("text") != tag:
@@ -1747,11 +1703,11 @@ class App(ctk.CTk):
                 row["shown"] = False
                 row["chat_id"] = None
 
-        if total <= CHAT_POOL_SIZE:
+        if total <= self.chat_visible_count:
             self.chat_scrollbar.set(0.0, 1.0)
         else:
             self.chat_scrollbar.set(self.chat_offset / total,
-                                    min(1.0, (self.chat_offset + CHAT_POOL_SIZE) / total))
+                                    min(1.0, (self.chat_offset + self.chat_visible_count) / total))
 
     def _update_chat_counts(self):
         """Shows what was loaded, so 'are all my groups here' is answerable."""
@@ -1774,33 +1730,145 @@ class App(ctk.CTk):
         frame = ctk.CTkFrame(parent)
         frame.grid(row=index, column=0, sticky="ew", padx=5, pady=2)
         frame.grid_remove()
-        frame.grid_columnconfigure(1, weight=1)
+        frame.grid_columnconfigure(0, weight=1)
 
-        lbl_name = ctk.CTkLabel(frame, text="", width=240, anchor="w")
-        lbl_name.grid(row=0, column=0, padx=(8, 4), pady=4)
+        lbl_name = ctk.CTkLabel(frame, text="", width=1, height=24, anchor="w")
+        lbl_name.grid(row=0, column=0, columnspan=2, padx=(8, 4), pady=(2, 0), sticky="ew")
+        source = ctk.CTkLabel(frame, text="", width=1, height=20, anchor="w", text_color="gray70")
+        source.grid(row=1, column=0, columnspan=2, padx=8, sticky="ew")
 
-        pbar = ctk.CTkProgressBar(frame, width=200)
+        pbar = ctk.CTkProgressBar(frame, width=80)
         pbar.set(0.0)
-        pbar.grid(row=0, column=1, padx=8, pady=4, sticky="ew")
+        pbar.grid(row=2, column=0, padx=8, pady=(3, 6), sticky="ew")
 
-        lbl_status = ctk.CTkLabel(frame, text="", width=170, anchor="w")
-        lbl_status.grid(row=0, column=2, padx=4, pady=4)
+        lbl_status = ctk.CTkLabel(frame, text="", width=135, height=20, anchor="e")
+        lbl_status.grid(row=2, column=1, padx=4, pady=(0, 4))
 
         row: Dict[str, Any] = {
             "frame": frame, "name": lbl_name, "pbar": pbar,
             "status": lbl_status, "item_id": None, "shown": False,
+            "source": source, "item": None,
         }
 
-        btn_cancel = ctk.CTkButton(frame, text="Cancel", width=70, fg_color="red",
+        btn_cancel = ctk.CTkButton(frame, text="Cancel", width=62, height=24, fg_color="red",
                                    command=lambda r=row: self._on_row_cancel(r))
-        btn_cancel.grid(row=0, column=3, padx=(4, 8), pady=4)
+        btn_cancel.grid(row=0, column=2, padx=(4, 8), pady=4)
         row["cancel"] = btn_cancel
+        info = ctk.CTkButton(frame, text="Details", width=62, height=24,
+                             command=lambda r=row: self._show_item_details(r))
+        info.grid(row=1, column=2, rowspan=2, padx=(4, 8), pady=4)
+        row["info"] = info
 
-        for widget in (frame, lbl_name, lbl_status):
-            widget.bind("<MouseWheel>", self._on_queue_wheel)
-            widget.bind("<Button-4>", self._on_queue_wheel)
-            widget.bind("<Button-5>", self._on_queue_wheel)
+        for widget in (frame, lbl_name, lbl_status, source, pbar, btn_cancel, info):
+            self._bind_list_widget(widget, "queue")
+        info.bind("<FocusIn>", lambda _e, r=row: self._focus_row("queue", r))
         return row
+
+    def _schedule_list_resize(self, kind):
+        previous = self._resize_jobs.get(kind)
+        if previous is not None:
+            self.after_cancel(previous)
+        self._resize_jobs[kind] = self.after(30, lambda: self._resize_list(kind))
+
+    def _resize_list(self, kind):
+        self._resize_jobs.pop(kind, None)
+        body = self.chat_body if kind == "chat" else self.queue_body
+        rows = self.chat_rows if kind == "chat" else self.queue_rows
+        if not rows or body.winfo_height() <= 1:
+            return
+        # Request height includes font/widget scaling; external grid padding does not.
+        frame = rows[0]["frame"]
+        outside = int(frame._apply_widget_scaling(4) + 0.999) if kind == "queue" else 0
+        row_height = max(1, frame.winfo_reqheight() + outside)
+        capacity = min(len(rows), max(1, (body.winfo_height() - 2) // row_height))
+        if kind == "chat":
+            self.chat_visible_count = capacity
+            self.chat_counts_label.configure(wraplength=max(180, body.winfo_width()))
+            self._render_chat_window()
+        else:
+            self.queue_visible_count = capacity
+            wrap = max(220, body.winfo_width() - 12)
+            self.queue_summary.configure(wraplength=wrap)
+            self.queue_header.configure(wraplength=wrap)
+            self._render_queue_window()
+
+    def _bind_list_widget(self, widget, kind):
+        wheel = self._on_chat_wheel if kind == "chat" else self._on_queue_wheel
+        for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(event, wheel)
+        for key in ("Up", "Down", "Prior", "Next", "Home", "End"):
+            widget.bind(f"<{key}>", lambda event, k=kind: self._on_list_key(k, event))
+        if isinstance(widget, (ctk.CTkButton, ctk.CTkCheckBox)):
+            widget._keyboard_enabled = True
+            target = getattr(widget, "_text_label", None) or getattr(widget, "_canvas", widget)
+            target.configure(takefocus=True)
+            action = widget.invoke if isinstance(widget, ctk.CTkButton) else widget.toggle
+            def activate(_event):
+                action()
+                return "break"
+            widget.bind("<Return>", activate)
+            widget.bind("<space>", activate)
+
+    def _enable_keyboard_controls(self, parent):
+        for widget in parent.winfo_children():
+            self._enable_keyboard_widget(widget)
+            self._enable_keyboard_controls(widget)
+
+    def _enable_keyboard_widget(self, widget):
+        if (isinstance(widget, (ctk.CTkButton, ctk.CTkCheckBox, ctk.CTkRadioButton))
+                and not getattr(widget, "_keyboard_enabled", False)):
+            target = getattr(widget, "_text_label", None) or getattr(widget, "_canvas", widget)
+            target.configure(takefocus=True)
+            action = widget.toggle if isinstance(widget, ctk.CTkCheckBox) else widget.invoke
+            def activate(_event):
+                action()
+                return "break"
+            widget.bind("<Return>", activate)
+            widget.bind("<space>", activate)
+            widget._keyboard_enabled = True
+
+    def _focus_row(self, kind, row):
+        rows = self.chat_rows if kind == "chat" else self.queue_rows
+        offset = self.chat_offset if kind == "chat" else self.queue_offset
+        setattr(self, f"{kind}_focus_index", offset + rows.index(row))
+
+    def _on_list_key(self, kind, event):
+        total = len(self.filtered_chats) if kind == "chat" else self._queue_window(0, 0)[0]
+        if not total:
+            return "break"
+        count = self.chat_visible_count if kind == "chat" else self.queue_visible_count
+        current = getattr(self, f"{kind}_focus_index")
+        key = event.keysym
+        target = {"Home": 0, "End": total - 1}.get(key, current + {
+            "Up": -1, "Down": 1, "Prior": -count, "Next": count}.get(key, 0))
+        target = max(0, min(total - 1, target))
+        offset = getattr(self, f"{kind}_offset")
+        offset = min(offset, target)
+        if target >= offset + count:
+            offset = target - count + 1
+        setattr(self, f"{kind}_offset", offset)
+        setattr(self, f"{kind}_focus_index", target)
+        render = self._render_chat_window if kind == "chat" else self._render_queue_window
+        render()
+        rows = self.chat_rows if kind == "chat" else self.queue_rows
+        rows[target - offset]["cb" if kind == "chat" else "info"].focus_set()
+        return "break"
+
+    def _show_chat_details(self, row):
+        entry = next((e for e in self.all_chats if e.id == row.get("chat_id")), None)
+        if entry is not None:
+            self._show_details("Chat details", f"{entry.name}\n\n{entry.kind}\nChat ID: {entry.id}")
+
+    def _show_item_details(self, row):
+        item = row.get("item")
+        if item is None:
+            return
+        details = (f"{item.file_name}\n\nChat: {item.chat_name}\n"
+                   f"Size: {human_size(item.file_size or 0)}\nStatus: {self._format_item_status(item)}")
+        error = getattr(item, "last_error", "")
+        if error:
+            details += f"\n\nIssue: {error}\nUse Retry failed after resolving the issue."
+        self._show_details("File details", details)
 
     def _build_page_settings(self):
         self.page_settings.grid_columnconfigure(0, weight=1)
@@ -1861,13 +1929,15 @@ class App(ctk.CTk):
         ctk.CTkButton(f_parts, text="🧽 Clean up .part files", width=180,
                       command=self.on_clean_parts).pack(side="right")
 
-        ctk.CTkButton(box, text="💾 Save Settings", fg_color="green",
-                      command=self.on_save_settings).pack(anchor="e", padx=15, pady=15)
+        self.save_settings_button = ctk.CTkButton(box, text="Save settings", fg_color="green",
+                                                 command=self.on_save_settings)
+        self.save_settings_button.pack(anchor="e", padx=15, pady=15)
 
         self.on_settings_slider_change(None)
 
     def select_page(self, page_name: str):
         """Switches the active page."""
+        self.current_page = page_name
         self.page_groups.grid_forget()
         self.page_queue.grid_forget()
         self.page_settings.grid_forget()
@@ -1882,10 +1952,12 @@ class App(ctk.CTk):
             self.page_accounts.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
         elif page_name == "groups":
             self.page_groups.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
+            self._schedule_list_resize("chat")
         elif page_name == "queue":
             self.page_queue.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
             self._sidebar_dirty = True
             self._queue_dirty = True
+            self._schedule_list_resize("queue")
         elif page_name == "settings":
             self.page_settings.grid(row=0, column=1, sticky="nsew", padx=15, pady=15)
             self._refresh_parts_label()
@@ -1895,20 +1967,23 @@ class App(ctk.CTk):
     def _filtered_items(self) -> List[DownloadItem]:
         return self.backend.snapshot_queue(self.active_group_filter)
 
+    def _queue_window(self, offset, limit):
+        return self.backend.snapshot_queue_window(self.active_group_filter, offset, limit)
+
     def _mark_sidebar_dirty(self):
         self._sidebar_dirty = True
 
     def _on_queue_scroll(self, *args):
         """Tk scrollbar protocol handler driving the virtual window offset."""
-        items_len = len(self._filtered_items())
-        max_offset = max(0, items_len - ROW_POOL_SIZE)
+        items_len = self._queue_window(0, 0)[0]
+        max_offset = max(0, items_len - self.queue_visible_count)
         if not args:
             return
         if args[0] == "moveto":
             self.queue_offset = int(round(float(args[1]) * items_len))
         elif args[0] == "scroll":
             amount = int(args[1])
-            step = ROW_POOL_SIZE if len(args) > 2 and args[2] == "pages" else 1
+            step = self.queue_visible_count if len(args) > 2 and args[2] == "pages" else 1
             self.queue_offset += amount * step
         self.queue_offset = max(0, min(self.queue_offset, max_offset))
         self._render_queue_window()
@@ -1924,23 +1999,24 @@ class App(ctk.CTk):
             delta *= 3
         if not delta:
             return
-        items_len = len(self._filtered_items())
-        max_offset = max(0, items_len - ROW_POOL_SIZE)
+        items_len = self._queue_window(0, 0)[0]
+        max_offset = max(0, items_len - self.queue_visible_count)
         self.queue_offset = max(0, min(self.queue_offset - delta, max_offset))
         self._render_queue_window()
 
     def _render_queue_window(self):
         """Repaints the visible window by rebinding pooled rows. Cost is O(pool)."""
-        items = self._filtered_items()
-        total = len(items)
-        max_offset = max(0, total - ROW_POOL_SIZE)
-        self.queue_offset = max(0, min(self.queue_offset, max_offset))
+        total, items = self._queue_window(self.queue_offset, self.queue_visible_count)
+        max_offset = max(0, total - self.queue_visible_count)
+        offset = max(0, min(self.queue_offset, max_offset))
+        if offset != self.queue_offset:
+            total, items = self._queue_window(offset, self.queue_visible_count)
+        self.queue_offset = offset
 
         self.visible_rows.clear()
         for i, row in enumerate(self.queue_rows):
-            idx = self.queue_offset + i
-            if idx < total:
-                item = items[idx]
+            if i < len(items) and i < self.queue_visible_count:
+                item = items[i]
                 self._bind_row(row, item)
                 self.visible_rows[item.id] = row
                 if not row["shown"]:
@@ -1950,19 +2026,23 @@ class App(ctk.CTk):
                 row["frame"].grid_remove()
                 row["shown"] = False
                 row["item_id"] = None
+                row["item"] = None
 
-        if total <= ROW_POOL_SIZE:
+        if total <= self.queue_visible_count:
             self.queue_scrollbar.set(0.0, 1.0)
         else:
             first = self.queue_offset / total
-            last = min(1.0, (self.queue_offset + ROW_POOL_SIZE) / total)
+            last = min(1.0, (self.queue_offset + self.queue_visible_count) / total)
             self.queue_scrollbar.set(first, last)
 
     def _bind_row(self, row: Dict[str, Any], item: DownloadItem):
         row["item_id"] = item.id
+        row["item"] = item
         name = item.file_name if len(item.file_name) <= 38 else item.file_name[:35] + "..."
         if row["name"].cget("text") != name:
             row["name"].configure(text=name)
+        source = item.chat_name if len(item.chat_name) <= 42 else item.chat_name[:39] + "..."
+        row["source"].configure(text=source)
         row["pbar"].set(item.progress)
         row["status"].configure(text=self._format_item_status(item))
         row["cancel"].configure(
@@ -1994,54 +2074,84 @@ class App(ctk.CTk):
             self._bind_row(row, item)
 
     def _update_summary(self):
-        stats = self.backend.queue_stats()
-        if not stats.total:
-            self.queue_summary.configure(text="Queue is empty.")
-            return
-        parts = [
-            f"{stats.total} files",
-            f"{stats.done} done",
-            f"{stats.active} active",
-            f"{stats.queued} queued",
-        ]
-        if stats.failed:
-            parts.append(f"{stats.failed} failed/cancelled")
-        if stats.total_bytes:
-            parts.append(human_size(stats.total_bytes))
-        if stats.speed:
-            parts.append(f"{stats.speed / (1024 * 1024):.1f} MB/s")
+        def describe(stats):
+            if not stats.total:
+                return "Queue is empty."
+            parts = [f"{stats.total} files", f"{stats.done} done", f"{stats.active} active",
+                     f"{stats.queued} queued"]
+            for field, label in (("failed", "failed"), ("cancelled", "cancelled"), ("paused", "paused")):
+                if getattr(stats, field, 0):
+                    parts.append(f"{getattr(stats, field)} {label}")
+            if stats.total_bytes:
+                parts.append(human_size(stats.total_bytes))
+            if stats.speed:
+                parts.append(f"{stats.speed / (1024 * 1024):.1f} MB/s")
+            return " · ".join(parts)
+        text = "All chats: " + describe(self.backend.queue_stats())
+        if self.active_group_filter is not None:
+            text = "Selected chat: " + describe(self.backend.queue_stats(self.active_group_filter)) + "\n" + text
         if self._flood_notice:
-            parts.append(self._flood_notice)
-        self.queue_summary.configure(text="  ·  ".join(parts))
+            text += "\n" + self._flood_notice
+        if self.queue_summary.cget("text") != text:
+            self.queue_summary.configure(text=text)
 
     def refresh_group_filter_sidebar(self):
         """Rebuilds the chat filter buttons from a snapshot taken under lock."""
         filter_str = self.search_queue_group_var.get().strip().lower() \
             if hasattr(self, "search_queue_group_var") else ""
 
+        snapshots = self.backend.snapshot_states()
+        current_ids = {snapshot.chat_id for snapshot in snapshots}
+        for chat_id in list(self.group_widgets):
+            if chat_id is not None and chat_id not in current_ids:
+                self.group_widgets.pop(chat_id).destroy()
+        if self.active_group_filter is not None and self.active_group_filter not in current_ids:
+            self.set_group_filter(None)
+
         if None not in self.group_widgets:
-            btn_all = ctk.CTkButton(self.group_filter_scroll, text="ALL Selected Groups",
+            btn_all = ctk.CTkButton(self.group_filter_scroll, text="All chats",
                                     command=lambda: self.set_group_filter(None))
             btn_all.pack(fill="x", padx=5, pady=3)
             self.group_widgets[None] = btn_all
+            self._enable_keyboard_widget(btn_all)
 
-        for snap in self.backend.snapshot_states():
-            text_str = f"{snap.chat_name} ({snap.total_completed}/{snap.total_discovered})"
+        all_color = "gray35" if self.active_group_filter is None else "gray25"
+        if self.group_widgets[None].cget("fg_color") != all_color:
+            self.group_widgets[None].configure(fg_color=all_color)
+        created = 0
+        for snap in snapshots:
+            name = snap.chat_name if len(snap.chat_name) <= 24 else snap.chat_name[:21] + "..."
+            status = getattr(snap, "status", "")
+            text_str = f"{name}\n{status} · {snap.total_completed}/{snap.total_discovered} found"
             should_show = not filter_str or filter_str in snap.chat_name.lower()
             btn = self.group_widgets.get(snap.chat_id)
 
             if btn is None:
+                if not should_show:
+                    continue
+                # A large selection must not construct hundreds of Tk buttons
+                # in one callback. Subsequent refresh turns finish the sidebar.
+                if created >= 8:
+                    self._sidebar_dirty = True
+                    continue
+                created += 1
                 btn = ctk.CTkButton(self.group_filter_scroll, text=text_str,
+                                    height=48,
                                     command=lambda cid=snap.chat_id: self.set_group_filter(cid))
                 self.group_widgets[snap.chat_id] = btn
+                self._enable_keyboard_widget(btn)
                 if should_show:
                     btn.pack(fill="x", padx=5, pady=3)
                 continue
 
             if btn.cget("text") != text_str:
                 btn.configure(text=text_str)
+            color = "gray35" if snap.chat_id == self.active_group_filter else "gray25"
+            if btn.cget("fg_color") != color:
+                btn.configure(fg_color=color)
             if should_show:
-                btn.pack(fill="x", padx=5, pady=3)
+                if not btn.winfo_manager():
+                    btn.pack(fill="x", padx=5, pady=3)
             else:
                 btn.pack_forget()
 
@@ -2049,12 +2159,40 @@ class App(ctk.CTk):
         self.active_group_filter = chat_id
         self.queue_offset = 0
         if chat_id is None:
-            self.queue_header.configure(text="Download Queue: ALL Groups")
+            self.queue_header.configure(text="Download Queue: All chats")
         else:
             name = next((s.chat_name for s in self.backend.snapshot_states()
                          if s.chat_id == chat_id), f"Chat {chat_id}")
             self.queue_header.configure(text=f"Download Queue: {name}")
         self._render_queue_window()
+        self._update_summary()
+        self._update_chat_action_buttons()
+        self._sidebar_dirty = True
+
+    def _update_chat_action_buttons(self):
+        for button in self.chat_action_buttons:
+            button.configure(state="normal" if self.active_group_filter is not None else "disabled")
+
+    def _control_downloads(self, action, all_chats=False):
+        if self.page_accounts.busy or (self.backend.accounts and not self.backend.authorized):
+            self.set_status("Finish connecting your account first.")
+            return
+        chat_id = None if all_chats else self.active_group_filter
+        if not all_chats and chat_id is None:
+            return
+        scope = "all chats" if all_chats else "the selected chat"
+        if action == "cancel" and not messagebox.askyesno(
+                "Cancel downloads", f"Cancel pending downloads from {scope}? You can resume them later."):
+            return
+        self.set_status(f"Applying {action} to {scope}...")
+        async def run():
+            try:
+                count = await (self.backend.control_all(action) if all_chats
+                               else self.backend.control_chat(chat_id, action))
+                self.backend.emit_event("action_finished", f"{action.capitalize()} applied to {scope} ({count} items).")
+            except Exception as exc:
+                self.backend.emit_event("error", f"Could not {action} {scope}: {exc}")
+        self.backend.run_coro(run())
 
     # ------------------------------------------------------------------ handlers
 
@@ -2064,11 +2202,11 @@ class App(ctk.CTk):
         show_archived = not self.show_archived_box or self.show_archived_box.get() == 1
 
         def keep(e: ChatEntry) -> bool:
+            if self.selected_only_var.get() and e.id not in self.selected_chat_ids:
+                return False
             if e.archived and not show_archived:
                 return False
-            # A selected chat stays visible even if the filters would hide it,
-            # so a narrowed filter can never silently drop it from the download.
-            if kinds and e.kind not in kinds and e.id not in self.selected_chat_ids:
+            if not self.selected_only_var.get() and e.kind not in kinds:
                 return False
             return not query or query in e.name.lower()
 
@@ -2079,19 +2217,42 @@ class App(ctk.CTk):
 
     def on_select_all_shown(self):
         self.selected_chat_ids.update(e.id for e in self.filtered_chats)
+        self._selection_changed()
         self._render_chat_window()
         self._update_chat_counts()
         self.set_status(f"Selected {len(self.selected_chat_ids)} chat(s).")
 
     def on_clear_chat_selection(self):
         self.selected_chat_ids.clear()
+        self._selection_changed()
         self._render_chat_window()
         self._update_chat_counts()
 
     def _selected_dialogs(self) -> List[ChatEntry]:
         return [e for e in self.all_chats if e.id in self.selected_chat_ids]
 
+    def _selection_changed(self):
+        if self._scan_busy:
+            self.on_cancel_scan()
+        self._scan_request = None
+        if self.ext_checkboxes:
+            self.populate_scanned_extensions()
+        self.scan_status.configure(text="Selection changed. Scan these chats to choose formats.")
+
+    def _set_scan_busy(self, busy):
+        self._scan_busy = busy
+        self.scan_button.configure(state="disabled" if busy else "normal")
+        self.cancel_scan_button.configure(state="normal" if busy else "disabled")
+
+    def on_cancel_scan(self):
+        self._scan_request = None
+        self.backend.cancel_extension_scan()
+        self._set_scan_busy(False)
+        self.scan_status.configure(text="Scan cancelled. You can start a new scan.")
+
     def on_scan_extensions(self):
+        if self._scan_busy:
+            return
         if self.page_accounts.busy or (self.backend.accounts and not self.backend.authorized):
             self.set_status("Finish connecting your account first.")
             return
@@ -2101,9 +2262,13 @@ class App(ctk.CTk):
             return
         logger.info("Scanning extensions for %d chats.", len(selected))
         self.set_status(f"Scanning {len(selected)} chat(s)...")
-        self.backend.run_coro(self.backend.scan_extensions(selected))
+        self.scan_status.configure(text=f"Scanning {len(selected)} chats...")
+        self._set_scan_busy(True)
+        self._scan_request = self.backend.begin_extension_scan(selected)
 
     def on_start_downloads(self):
+        if self._starting_downloads:
+            return
         if self.page_accounts.busy or (self.backend.accounts and not self.backend.authorized):
             self.set_status("Finish connecting your account first.")
             return
@@ -2112,64 +2277,58 @@ class App(ctk.CTk):
             messagebox.showwarning("Selection Required", "Please select at least one chat in Step 1.")
             return
 
-        err = check_output_dir(self.backend.config.get("output_dir", ""))
-        if err:
-            messagebox.showerror("Download folder unusable", err)
-            self.set_status(f"⚠️ {err}")
-            return
-
-        all_formats = False
-        selected_exts: Set[str] = set()
-        for ext, cb in self.ext_checkboxes.items():
-            if cb.get() == 1:
-                if ext == "*":
-                    all_formats = True
-                else:
-                    selected_exts.add(ext)
+        all_formats = self.format_mode.get() == "all"
+        selected_exts = {ext for ext, cb in self.ext_checkboxes.items() if cb.get() == 1}
         if not all_formats and not selected_exts:
-            all_formats = True
-
-        logger.info("Start Downloads: %d chats, exts=%s, all_formats=%s",
-                    len(selected_dialogs), selected_exts, all_formats)
-        self.backend.run_coro(
-            self.backend.enqueue_selected_chats(selected_dialogs, selected_exts,
-                                                all_formats=all_formats))
-        self.select_page("queue")
+            self.scan_status.configure(text="Choose at least one format, or select All files.")
+            self.set_status("No downloads added: choose at least one format.")
+            return
+        if self._scan_busy:
+            self.on_cancel_scan()
+        output_dir = self.backend.config.get("output_dir", "")
+        generation = self.backend._account_generation
+        self._starting_downloads = True
+        self.start_button.configure(state="disabled")
+        def finished():
+            self._starting_downloads = False
+            self.start_button.configure(state="normal")
+        def ready(err):
+            if generation != self.backend._account_generation:
+                return
+            if err:
+                self.show_error(f"Download folder unusable: {err}. Choose a writable folder in Settings.")
+                return
+            self.backend.run_coro(self.backend.enqueue_selected_chats(
+                selected_dialogs, selected_exts, all_formats=all_formats))
+            self.set_status(f"Discovering files from {len(selected_dialogs)} chats...")
+            self.select_page("queue")
+        self._run_background("Checking download folder...", lambda: check_output_dir(output_dir), ready, finished)
 
     def on_clear_completed(self):
-        removed = self.backend.clear_completed()
         self.queue_offset = 0
-        self.set_status(f"Cleared {removed} finished item(s).")
+        self._control_downloads("clear", all_chats=True)
 
     def on_retry_failed(self):
         if self.page_accounts.busy or (self.backend.accounts and not self.backend.authorized):
             self.set_status("Finish connecting your account first.")
             return
-        count = self.backend.retry_failed()
-        self.set_status(f"Requeued {count} item(s)." if count else "Nothing to retry.")
+        self._control_downloads("retry", all_chats=True)
 
     def on_cancel_all(self):
-        if messagebox.askyesno("Cancel all", "Cancel every queued and in-flight download?"):
-            self.backend.cancel_all()
-            self.set_status("Cancelled all pending downloads.")
+        self._control_downloads("cancel", all_chats=True)
 
     def on_open_output_dir(self):
         path = self.backend.config.get("output_dir", "")
-        if not os.path.isdir(path):
-            messagebox.showwarning("Not found", f"'{path}' does not exist yet.")
-            return
-        try:
-            # subprocess.run with an argv list, never a shell string: output_dir is
-            # user-supplied and a path containing quotes would otherwise be
-            # interpreted as shell syntax.
+        def open_folder():
+            if not os.path.isdir(path):
+                raise FileNotFoundError(f"'{path}' does not exist yet.")
             if sys.platform == "darwin":
-                subprocess.run(["open", path], check=False)
+                subprocess.run(["open", path], check=True, timeout=15)
             elif os.name == "nt":
                 os.startfile(path)  # type: ignore[attr-defined]
             else:
-                subprocess.run(["xdg-open", path], check=False)
-        except Exception as e:
-            messagebox.showerror("Could not open folder", str(e))
+                subprocess.run(["xdg-open", path], check=True, timeout=15)
+        self._run_background("Opening download folder...", open_folder)
 
     def on_browse_output_dir(self):
         chosen = filedialog.askdirectory(initialdir=self.entry_output_dir.get() or BASE_DIR)
@@ -2186,60 +2345,92 @@ class App(ctk.CTk):
         )
 
     def on_save_settings(self):
-        target = self.entry_output_dir.get().strip()
-        err = check_output_dir(os.path.abspath(os.path.expanduser(target))) if target else "Choose a folder."
-        if err:
-            messagebox.showerror("Download folder unusable", err)
+        if self._saving_settings:
             return
-        self.backend.update_config({
+        target = self.entry_output_dir.get().strip()
+        if not target:
+            self.show_error("Choose a download folder in Settings.")
+            return
+        config = {
             "output_dir": target,
             "max_parallel_files": int(self.slider_parallel.get()),
             "scan_depth": int(self.slider_depth.get()),
-        })
-        self.entry_output_dir.delete(0, "end")
-        self.entry_output_dir.insert(0, self.backend.config["output_dir"])
-        self.set_status("Settings saved.")
-        self._refresh_parts_label()
+        }
+        self._saving_settings = True
+        self.save_settings_button.configure(state="disabled")
+        def finished():
+            self._saving_settings = False
+            self.save_settings_button.configure(state="normal")
+        def save():
+            err = check_output_dir(os.path.abspath(os.path.expanduser(target)))
+            if err:
+                raise OSError(err)
+            err = self.backend.update_config(config)
+            if err:
+                raise OSError(f"Could not save settings: {err}")
+            return self.backend.config["output_dir"]
+        def saved(directory):
+            self.entry_output_dir.delete(0, "end")
+            self.entry_output_dir.insert(0, directory)
+            self.set_status("Settings saved.")
+            self._refresh_parts_label()
+        self._run_background("Saving settings...", save, saved, finished)
 
     def _refresh_parts_label(self):
-        count, total = self.backend.sweep_orphan_parts()
-        if count:
-            self.lbl_parts.configure(
-                text=f"{count} leftover .part file(s) from interrupted runs ({human_size(total)}).")
-        else:
-            self.lbl_parts.configure(text="No leftover .part files.")
+        root = self.backend.config.get("output_dir", "")
+        self.lbl_parts.configure(text="Checking incomplete files...")
+        def checked(result):
+            if self.backend.config.get("output_dir", "") != root:
+                return
+            count, total = result
+            self.lbl_parts.configure(text=(f"{count} unowned .part file(s) ({human_size(total)})."
+                                           if count else "No unowned .part files."))
+        self._run_background("Checking incomplete files...", lambda: self.backend.sweep_orphan_parts(root), checked)
 
     def on_clean_parts(self):
-        count, total = self.backend.sweep_orphan_parts()
-        if not count:
-            messagebox.showinfo("Nothing to clean", "No leftover .part files were found.")
-            return
-        if messagebox.askyesno(
-            "Delete partial downloads",
-            f"Delete {count} incomplete .part file(s), freeing {human_size(total)}?\n\n"
-            "These are fragments of interrupted downloads. The files will be "
-            "downloaded again from the start when re-queued."
-        ):
-            removed, freed = self.backend.delete_orphan_parts()
-            self.set_status(f"Removed {removed} .part file(s), freed {human_size(freed)}.")
-            self._refresh_parts_label()
+        root = self.backend.config.get("output_dir", "")
+        def inspected(result):
+            count, total = result
+            if not count:
+                self.set_status("No unowned partial downloads to clean.")
+                return
+            if messagebox.askyesno("Delete partial downloads",
+                    f"Delete {count} unowned partial file(s) from {root}, freeing {human_size(total)}?\n\n"
+                    "Active downloads and files kept for resume are preserved."):
+                def cleaned(result):
+                    removed, freed = result
+                    self._refresh_parts_label()
+                    self.set_status(f"Removed {removed} .part file(s), freed {human_size(freed)}.")
+                self._run_background("Cleaning partial files...", lambda: self.backend.delete_orphan_parts(root), cleaned)
+        self._run_background("Checking incomplete files...", lambda: self.backend.sweep_orphan_parts(root), inspected)
 
     def _offer_orphan_cleanup(self):
-        count, total = self.backend.sweep_orphan_parts()
-        if count:
-            self.set_status(
-                f"{count} leftover .part file(s) ({human_size(total)}) from interrupted runs "
-                "— see Settings to clean up."
-            )
+        root = self.backend.config.get("output_dir", "")
+        def checked(result):
+            count, total = result
+            if count and self.backend.config.get("output_dir", "") == root:
+                self.set_status(f"{count} unowned .part file(s) ({human_size(total)}) — see Settings to clean up.")
+        self._run_background("Checking incomplete files...", lambda: self.backend.sweep_orphan_parts(root), checked)
 
     def on_close(self):
         """Cancels in-flight work and disconnects before the window goes away."""
-        try:
-            self.backend.shutdown()
-        except Exception as e:
-            logger.warning("Error during shutdown: %s", e)
-        finally:
-            self.destroy()
+        if getattr(self, "_closing", False):
+            return
+        self._closing = True
+        self.withdraw()
+        stopped = threading.Event()
+        def stop():
+            try:
+                self.backend.shutdown()
+            finally:
+                stopped.set()
+        threading.Thread(target=stop, name="downloader-shutdown", daemon=True).start()
+        def finish():
+            if stopped.is_set():
+                self.destroy()
+            else:
+                self.after(30, finish)
+        finish()
 
 
 def load_credentials() -> Tuple[int, str]:

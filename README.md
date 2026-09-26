@@ -50,7 +50,9 @@ The app reports these separately and lets you retry from **Accounts**.
   Saved API details remain available for a later login. Other saved sessions remain signed in.
 
 Connecting, switching accounts, and logging out stop pending downloads and clear
-this run's queue and chat selections. Completed files remain on disk.
+this run's queue and chat selections. Completed files and recognized resumable
+fragments remain on disk. Reconnect the same account and select its chats again
+to continue those downloads.
 
 Existing `.env` credentials and `TG_SESSION_NAME` are imported on first use,
 keeping the original session path. Once profiles have been saved, `accounts.json`
@@ -82,41 +84,103 @@ The credential files are ignored by Git; keep them out of shared backups.
 
 1. **Groups & Formats** — tick the chats you want. Every chat, channel and group
    is loaded, including archived ones; the type toggles (Group / Channel / DM /
-   Bot) and *Include archived* only narrow what is *listed*, and a chat you have
-   already ticked stays visible even when a filter would hide it. The counter
-   shows `loaded (by type) · shown · selected` so you can confirm nothing is
-   missing. *Select all shown* ticks everything currently listed.
-   *Scan Selected Chats* walks recent history and lists the file types it found;
-   leave *ALL Formats* ticked to take everything. Then *Start Downloads*.
-2. **Download Queue** — live progress, per-file Cancel, and a per-chat filter
-   sidebar showing `completed/discovered`. Files are fetched in batches and the
-   queue refills itself as it drains, so very large chats stream rather than
-   being enumerated up front.
+   Bot) and *Include archived* narrow the list without clearing your selection.
+   Use *Show selected chats only* to review it; clear the search and enable
+   archived chats when reviewing the entire selection. *Select all shown* ticks
+   the current list.
+   Choose **All files**, or choose **Selected formats**, scan the selected chats,
+   and tick at least one extension. Scans show progress and can be cancelled;
+   changing the chat selection invalidates the previous scan. Click
+   **Add to downloads** to create jobs for all selected chats.
+2. **Download Queue** — each row shows its source chat, progress, and file details.
+   Select a chat in the sidebar for its totals and **Pause chat**, **Resume**,
+   **Cancel**, and **Retry failed** actions. The sidebar also has explicit controls
+   for all downloads. Errors remain available in **View issues**; a later progress
+   update does not erase them. Lists adapt their visible rows to the window size
+   and support keyboard navigation.
 3. **Settings** — download folder, parallel downloads (1–10), scan depth
-   (0 = unlimited), and cleanup for leftover `.part` files.
+   (0 = unlimited, for format scanning), and cleanup for unrecognized `.part`
+   files. Folder checks, settings writes, and cleanup run in the background.
 
-Downloads land in `<output_dir>/<chat name>/<file name>`. A file already on disk
-with the expected size is skipped, so re-running is cheap and interrupted runs
-resume. A different file that happens to share a name is saved as
-`name (2).ext` rather than overwriting.
+Multiple chat jobs keep their own format selections. Repeated **Add to downloads**
+does not create overlapping history scans or duplicate queue entries. Cancel a
+running job before adding it with different formats. Discovery uses at most three
+concurrent history requests. At most 50 transfers per chat and 500 globally are
+admitted to run; additional resumed work waits for capacity. File transfers use
+the separate parallel-download setting and share slots across chats. Completed
+history remains visible until **Clear completed** removes it.
 
-Telegram rate limits (FloodWait) pause the whole queue and resume automatically;
-they no longer fail the affected files. Failed items can be requeued with
-*Retry Failed*.
+Each job keeps the output directory selected when it was added, including through
+retries, pause, and resume. Changing Settings affects newly added jobs without
+moving an existing job's remaining files into a different directory.
+
+**Pause** stops discovery and transfers while retaining progress. **Cancel** also
+stops the selected work; **Resume** can restore paused or cancelled items.
+**Retry failed** retries failed transfers and failed discovery, and
+**Clear completed** removes only completed/skipped rows, preserving failed and
+cancelled work. Stopping a job waits for its old workers before a resume can start.
+
+Telegram rate limits pause discovery and new transfer dispatch until the server's
+deadline. Retries also use backoff. Jobs resume automatically unless you have
+paused or cancelled them; exhausted retries remain visible for manual recovery.
+
+### Existing files, safe names, and resume
+
+Downloads normally land in `<output_dir>/<chat name>/<file name>`. Chats with the
+same sanitized title receive distinct directories, and colliding filenames receive
+suffixes such as `name (2).ext`. Concurrent transfers cannot overwrite each other's
+destinations.
+
+Each output directory contains a local `.telegram-downloader.sqlite3` manifest.
+It records the account, chat, message, and media identity associated with each
+destination and partial file. A previous download is skipped only when its recorded
+size and content digest still match. Documents with a known size must finish at
+that exact size; Telegram photos allow their reported size to be an estimate.
+
+**Files downloaded before this manifest existed are preserved.** Their names and
+sizes alone cannot establish which Telegram message they came from, so the first
+new run may create suffixed copies instead of skipping them. Existing folders are
+reused where they can be associated safely; nothing is automatically renamed,
+overwritten, or deleted to migrate old downloads.
+
+Recognized document fragments survive pause, cancel, normal close, account
+switching, and transient failures. A later attempt resumes from a supported aligned
+offset. Changed media identities never reuse another file's fragment. If a resume
+stream ends early without a network error, the app can retry with a full transfer.
+Unindexed legacy `.part` files are preserved but are not trusted for automatic
+resume; Settings cleanup can remove these unrecognized fragments after confirmation.
+Cleanup excludes active transfers and valid manifest-owned partials.
+
+The queue and selected chats are still kept in memory. After reopening the app,
+select the chats and **Add to downloads** again to skip verified completed media
+and resume recognized fragments. Keep the manifest with its output directory;
+removing it loses that identity information and makes existing files unindexed.
 
 `downloader.log` rotates at 5 MB (3 backups).
 
 ## Tests
 
-No Telegram account or network needed — all suites use fakes. UI suites require a desktop session.
+No Telegram account or network is needed: suites use fake clients and temporary
+output directories. UI suites require a working desktop/Tk session.
 
 ```bash
-.venv/bin/python tests_auth.py    # credential storage and authentication lifecycle
-.venv/bin/python tests_auth_ui.py # real Accounts UI with fake Telegram responses
-.venv/bin/python tests_smoke.py   # backend: paths, config, download worker, retries, resume
-.venv/bin/python tests_ui.py      # builds the real Tk window and drives it
-.venv/bin/python bench_ui.py      # queue-view repaint cost vs. queue size
+.venv/bin/python -m unittest tests_auth tests_scheduler tests_storage tests_queue_state tests_scan
+.venv/bin/python tests_smoke.py
+.venv/bin/python tests_ui.py
+.venv/bin/python -m unittest tests_ui_regressions tests_auth_ui
+.venv/bin/python bench_responsiveness.py
+.venv/bin/python bench_ui.py after
 ```
+
+The focused suites cover authentication, bounded multi-chat scheduling, stop/resume
+races, safe file promotion, partial-file recovery, incremental queue snapshots,
+coalesced updates, and cancelled/superseded scans. See the
+[implementation and validation record](docs/audits/2026-09-26/FIXES.md) for recorded
+results and the distinction between fake-client checks and live Telegram behavior.
+The responsiveness benchmark exercises real Tk, scheduling, and disk writes with
+24 generated chat jobs and 10,000 retained rows; it saves a JSON report under
+`docs/audits/2026-09-26/`. The static repaint comparison is available separately
+through `bench_ui.py both`.
 
 ## Checking your chat list
 

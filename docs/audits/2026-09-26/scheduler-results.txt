@@ -1,0 +1,18 @@
+Error fetching batch for 'Chat 1' (1): synthetic mid-page failure
+Traceback (most recent call last):
+  File "/Users/trinadhthatakula/PyProjects/TelegramDownloader/interactive_downloader.py", line 681, in _fetch_next_chat_batch
+    async for msg in self.client.iter_messages(target_entity, **kwargs):
+    ...<27 lines>...
+            break
+  File "/Users/trinadhthatakula/PyProjects/TelegramDownloader/docs/audits/2026-09-26/probes/scheduler.py", line 35, in iter_messages
+    raise OSError('synthetic mid-page failure')
+OSError: synthetic mid-page failure
+Rate limited fetching 'Chat 1': 120s
+Rate limited by Telegram; pausing downloads for 120s.
+Rate limited fetching 'Chat 1': 120s
+Rate limited by Telegram; pausing downloads for 120s.
+cursor_loss {"after_failure": {"cursor": 3, "queue": []}, "retry_offsets": [null, 3], "final_queue": [2, 1]}
+global_filters {"chat1_requested": [".mp4"], "chat2_requested": [".jpg"], "chat1_actual": [".jpg"]}
+reenqueue {"iterator_calls": 2, "queue_ids": ["1_2", "1_1", "1_2"], "index_ids": ["1_2", "1_1"]}
+cancel_fetch {"queue_at_cancel": 0, "download_calls_after_cancel": 3, "final_statuses": ["Completed", "Completed", "Completed"]}
+flood_fetch {"flood_gate_remaining_seconds": 120, "scheduled_retry_seconds": 2, "fetch_calls_while_gate_active": 2}

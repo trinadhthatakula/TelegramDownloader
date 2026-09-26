@@ -1,0 +1,191 @@
+{
+  "recorded_at": "2026-09-26T09:52:54.914151+00:00",
+  "python": "3.14.7",
+  "platform": "macOS-27.2-arm64-arm-64bit-Mach-O",
+  "scenario": {
+    "groups": 24,
+    "files_per_group": 80,
+    "retained_completed_rows": 10000,
+    "bytes_per_file": 131072,
+    "parallel_files": 3,
+    "heartbeat_interval_ms": 20,
+    "workload_seconds": 15,
+    "uses_real_telegram": false,
+    "uses_real_tk_scheduler_and_storage": true
+  },
+  "capacity_semantics": "pending_files and pending_plus_reserved count admitted transfer slots; queued_and_active_rows also includes restored rows awaiting admission.",
+  "initial_layout": {
+    "construct_app_ms": 577.948,
+    "first_queue_layout_ms": 146.821,
+    "visible_queue_rows": 7
+  },
+  "final_queue": {
+    "total": 10830,
+    "active": 0,
+    "queued": 0,
+    "done": 10332,
+    "failed": 0,
+    "cancelled": 498,
+    "paused": 0,
+    "speed": 0.0,
+    "downloaded": 1354235904,
+    "total_bytes": 1419509760
+  },
+  "drain_ms": 5.752,
+  "persistent_ui_errors": [],
+  "heartbeat": {
+    "warmup": {
+      "samples": 84,
+      "p50_ms": 20.833,
+      "p95_ms": 39.52,
+      "max_ms": 73.095
+    },
+    "steady": {
+      "samples": 591,
+      "p50_ms": 21.022,
+      "p95_ms": 28.927,
+      "max_ms": 33.953
+    },
+    "drain": {
+      "samples": 4,
+      "p50_ms": 21.142,
+      "p95_ms": 24.198,
+      "max_ms": 24.198
+    },
+    "steady_lateness": {
+      "samples": 591,
+      "p50_ms": 1.022,
+      "p95_ms": 8.927,
+      "max_ms": 13.953
+    }
+  },
+  "action_callback_costs": {
+    "enqueue": {
+      "samples": 1,
+      "p50_ms": 0.387,
+      "p95_ms": 0.387,
+      "max_ms": 0.387
+    },
+    "scroll": {
+      "samples": 66,
+      "p50_ms": 3.038,
+      "p95_ms": 4.794,
+      "max_ms": 5.802
+    },
+    "pause_chat": {
+      "samples": 1,
+      "p50_ms": 1.916,
+      "p95_ms": 1.916,
+      "max_ms": 1.916
+    },
+    "resume_chat": {
+      "samples": 2,
+      "p50_ms": 1.912,
+      "p95_ms": 1.947,
+      "max_ms": 1.947
+    },
+    "cancel_chat": {
+      "samples": 1,
+      "p50_ms": 2.162,
+      "p95_ms": 2.162,
+      "max_ms": 2.162
+    },
+    "show_groups": {
+      "samples": 1,
+      "p50_ms": 0.949,
+      "p95_ms": 0.949,
+      "max_ms": 0.949
+    },
+    "show_queue": {
+      "samples": 1,
+      "p50_ms": 1.981,
+      "p95_ms": 1.981,
+      "max_ms": 1.981
+    }
+  },
+  "method_callback_costs": {
+    "_render_queue_window": {
+      "samples": 208,
+      "p50_ms": 1.233,
+      "p95_ms": 2.18,
+      "max_ms": 4.17
+    },
+    "_bind_row": {
+      "samples": 1459,
+      "p50_ms": 0.162,
+      "p95_ms": 0.353,
+      "max_ms": 1.068
+    },
+    "set_group_filter": {
+      "samples": 70,
+      "p50_ms": 1.927,
+      "p95_ms": 3.063,
+      "max_ms": 4.022
+    },
+    "_on_queue_scroll": {
+      "samples": 66,
+      "p50_ms": 1.109,
+      "p95_ms": 1.887,
+      "max_ms": 2.466
+    },
+    "_update_summary": {
+      "samples": 106,
+      "p50_ms": 0.081,
+      "p95_ms": 0.112,
+      "max_ms": 0.191
+    },
+    "refresh_group_filter_sidebar": {
+      "samples": 36,
+      "p50_ms": 0.633,
+      "p95_ms": 4.706,
+      "max_ms": 8.823
+    },
+    "snapshot_queue_window": {
+      "samples": 326,
+      "p50_ms": 0.004,
+      "p95_ms": 0.008,
+      "max_ms": 0.014
+    }
+  },
+  "peaks": {
+    "ui_event_backlog": 51,
+    "pending_files": 500,
+    "pending_plus_reserved": 500,
+    "per_chat_pending": 50,
+    "discovery_tasks": 3,
+    "active_workers": 3,
+    "queued_and_active_rows": 546,
+    "deferred_resume_rows": 46
+  },
+  "capacity_exceedances": [],
+  "traffic": {
+    "groups_started": 24,
+    "simultaneous_groups": 3,
+    "transfer_starts": 336,
+    "transport_completions": 332,
+    "transport_cancellations": 4,
+    "discovery_overlap": 3,
+    "final_files_on_disk": 332,
+    "every_final_file_has_expected_size": true,
+    "every_final_file_has_expected_payload": true,
+    "payload_files_checked": 332,
+    "payload_validation": "Full byte comparison after the measured Tk phase."
+  },
+  "watchdog_triggered": false,
+  "checks": {
+    "no_watchdog_timeout": true,
+    "discovery_bounded": true,
+    "pending_bounded": true,
+    "per_chat_pending_bounded": true,
+    "workers_bounded": true,
+    "multiple_groups_transfer_concurrently": true,
+    "every_group_started": true,
+    "cancellation_drained_workers": true,
+    "no_download_failures": true,
+    "files_match_completed_count": true,
+    "complete_files_have_correct_sizes": true,
+    "complete_files_have_correct_payloads": true,
+    "steady_heartbeat_p95_under_50ms": true,
+    "steady_heartbeat_max_under_200ms": true
+  }
+}

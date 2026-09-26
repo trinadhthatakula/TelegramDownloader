@@ -138,9 +138,9 @@ class AuthenticationMixin:
         self._phone_code_hash = None
         self._auth_lock = asyncio.Lock()
 
-    def auth_event(self, stage, message):
+    def auth_event(self, stage, message, **details):
         self.auth_stage = stage
-        self.emit_event("login_state", {"stage": stage, "message": message})
+        self.emit_event("login_state", {"stage": stage, "message": message, **details})
 
     async def _connect_account(self):
         if not self.api_id or not self.api_hash:
@@ -172,6 +172,7 @@ class AuthenticationMixin:
             data["active"] = self.profile_id
             self.accounts.commit(data)
         self.authorized = True
+        self.current_user_id = user.id
         self._phone = self._phone_code_hash = None
         name = user.first_name or str(user.id)
         self.auth_event("authorized", f"Signed in as {name} (ID {user.id}).")
@@ -233,7 +234,8 @@ class AuthenticationMixin:
         if not code_hash:
             raise ValueError("Telegram could not provide a login code. Try signing in again.")
         self._phone, self._phone_code_hash = phone, code_hash
-        self.auth_event("code", "Enter the code Telegram sent to your Telegram app or phone.")
+        self.auth_event("code", "Enter the code Telegram sent to your Telegram app or phone.",
+                        retry_after=getattr(sent, "timeout", None) or 60)
 
     async def authenticate(self, action, **values):
         async with self._auth_lock:
@@ -292,7 +294,8 @@ class AuthenticationMixin:
             except errors.ApiIdInvalidError:
                 self.auth_event("credentials", "Telegram rejected the API ID/hash. Copy them again from my.telegram.org/apps.")
             except errors.FloodWaitError as exc:
-                self.auth_event(self.auth_stage, f"Telegram rate limit: wait {exc.seconds} seconds before trying again.")
+                self.auth_event(self.auth_stage, f"Telegram rate limit: wait {exc.seconds} seconds before trying again.",
+                                retry_after=exc.seconds)
             except (errors.UnauthorizedError, errors.AuthKeyError):
                 self.authorized = False
                 self.auth_event("credentials", "This session is no longer valid. Use Add account to create a fresh login session.")
@@ -321,6 +324,10 @@ class AccountPage(ctk.CTkScrollableFrame):
         self.buttons = []
         self.fields = []
         self.sections = {}
+        self._last_action = None
+        self._resend_until = 0.0
+        self._login_retry_until = 0.0
+        self._cooldown_job = None
         ctk.CTkLabel(self, text="Telegram accounts", font=("Arial", 22, "bold")).pack(anchor="w", pady=(12, 8))
         self.picker = ctk.CTkOptionMenu(self, values=["Add account"], command=self.choose)
         self.picker.pack(fill="x", pady=6)
@@ -349,7 +356,7 @@ class AccountPage(ctk.CTkScrollableFrame):
 
         code = self.section("code")
         self.note(code, "Check your Telegram app or phone for the login code.")
-        self.code = self.entry(code, "Login code", secret=True)
+        self.code = self.entry(code, "Login code")
         self.code_button = self.button(code, "Continue", self.verify_code)
         self.resend_button = self.button(code, "Resend code", self.send_code)
         self.button(code, "Change phone number", self.change_phone)
@@ -357,6 +364,10 @@ class AccountPage(ctk.CTkScrollableFrame):
         password = self.section("password")
         self.note(password, "Your account uses two-step verification. Enter your Telegram password to finish signing in.")
         self.password = self.entry(password, "Two-step verification password", secret=True)
+        self.show_password = ctk.CTkCheckBox(password, text="Show password",
+                                            command=self.toggle_password_visibility)
+        self.show_password.pack(anchor="w", padx=12, pady=(0, 8))
+        self.fields.append(self.show_password)
         self.password_button = self.button(password, "Log in", self.verify_password)
         self.button(password, "Use another phone number", self.change_phone)
 
@@ -387,6 +398,18 @@ class AccountPage(ctk.CTkScrollableFrame):
                   "Downloaded files stay on disk. Login codes and passwords are never saved.")
         self.refresh()
         self.show_step("credentials")
+        for entry, action in ((self.api_id, self.save), (self.api_hash, self.save),
+                               (self.country_code, self.phone.focus_set), (self.phone, self.send_code),
+                               (self.code, self.verify_code), (self.password, self.verify_password)):
+            entry.bind("<Return>", lambda _event, fn=action: self.submit(fn))
+
+    def submit(self, action):
+        if not self.busy:
+            action()
+        return "break"
+
+    def toggle_password_visibility(self):
+        self.password.configure(show="" if self.show_password.get() else "*")
 
     def reset_profile(self):
         self.avatar_label.configure(image=self.empty_avatar_image, text="?")
@@ -432,6 +455,11 @@ class AccountPage(ctk.CTkScrollableFrame):
         widget = ctk.CTkButton(parent, text=text, command=command)
         widget.pack(anchor="w", padx=12, pady=6)
         self.buttons.append(widget)
+        widget._keyboard_enabled = True
+        target = getattr(widget, "_text_label", None) or widget._canvas
+        target.configure(takefocus=True)
+        widget.bind("<Return>", lambda _event: self.submit(widget.invoke))
+        widget.bind("<space>", lambda _event: self.submit(widget.invoke))
         return widget
 
     def show_step(self, step):
@@ -439,6 +467,9 @@ class AccountPage(ctk.CTkScrollableFrame):
         for frame in self.sections.values():
             frame.pack_forget()
         self.sections[step].pack(fill="x", pady=8)
+        if step != "password":
+            self.show_password.deselect()
+            self.password.configure(show="*")
         self.step_label.configure(text={
             "credentials": "API setup",
             "phone": "1. Phone number",
@@ -449,6 +480,7 @@ class AccountPage(ctk.CTkScrollableFrame):
         self.update_buttons()
         if not self.busy:
             self.focus_step()
+        self._parent_canvas.yview_moveto(0)
 
     def focus_step(self):
         entry = {"credentials": self.api_id, "phone": self.country_code,
@@ -469,6 +501,7 @@ class AccountPage(ctk.CTkScrollableFrame):
         if self.busy:
             return
         self.selected_key = self.choices[label]
+        self._resend_until = 0.0
         self.picker.set(label)
         profiles = self.backend.accounts.data["profiles"] if self.backend.accounts else {}
         profile = (profiles.get(self.selected_key) or profiles.get(self.backend.profile_id)
@@ -491,6 +524,8 @@ class AccountPage(ctk.CTkScrollableFrame):
     def clear_secrets(self):
         for entry in (self.country_code, self.phone, self.code, self.password):
             entry.delete(0, "end")
+        self.show_password.deselect()
+        self.password.configure(show="*")
 
     def update_buttons(self):
         state = "disabled" if self.busy else "normal"
@@ -505,6 +540,36 @@ class AccountPage(ctk.CTkScrollableFrame):
                                     (self.password_button, self.screen == "password" and self.stage == "password"),
                                     (self.logout_button, self.backend.authorized)):
                 button.configure(state="normal" if enabled else "disabled")
+        self._update_cooldown()
+
+    def _update_cooldown(self):
+        # Monotonic time is provided by the Tk-owned app module's clock as well;
+        # import locally to keep authentication protocol code independent.
+        import time
+        now = time.monotonic()
+        resend = max(0, int(self._resend_until - now + 0.999))
+        retry = max(0, int(self._login_retry_until - now + 0.999))
+        remaining = max(resend, retry)
+        self.resend_button.configure(text=f"Resend in {remaining}s" if remaining else "Resend code")
+        if remaining:
+            self.resend_button.configure(state="disabled")
+        elif not self.busy:
+            self.resend_button.configure(state="normal" if self.screen == "code" else "disabled")
+        if retry:
+            self.send_button.configure(state="disabled", text=f"Try again in {retry}s")
+            self.code_button.configure(state="disabled")
+            self.password_button.configure(state="disabled")
+        else:
+            self.send_button.configure(text="Send login code")
+        if self._cooldown_job is not None:
+            self.after_cancel(self._cooldown_job)
+            self._cooldown_job = None
+        if remaining:
+            self._cooldown_job = self.after(1000, self._cooldown_tick)
+
+    def _cooldown_tick(self):
+        self._cooldown_job = None
+        self.update_buttons()
 
     def open_browser(self):
         try:
@@ -515,8 +580,11 @@ class AccountPage(ctk.CTkScrollableFrame):
         self.status.configure(text=f"Open {API_SETUP_URL} in your browser.")
 
     def start(self, action, **values):
-        if self.busy:
+        import time
+        if self.busy or (action in ("send_code", "begin_login", "code", "password")
+                         and time.monotonic() < self._login_retry_until):
             return
+        self._last_action = action
         self.busy = True
         self.status.configure(text="Contacting Telegram...")
         self.update_buttons()
@@ -535,6 +603,9 @@ class AccountPage(ctk.CTkScrollableFrame):
             self.start("switch", key=self.selected_key)
 
     def send_code(self):
+        import time
+        if self.screen == "code" and time.monotonic() < self._resend_until:
+            return
         if self.selected_key is not None and self.selected_key != self.backend.profile_id:
             self.status.configure(text="Connect the selected saved account first.")
             return
@@ -566,7 +637,13 @@ class AccountPage(ctk.CTkScrollableFrame):
         self.start("password", password=password)
 
     def handle(self, data):
+        import time
         self.stage = data["stage"]
+        retry_after = data.get("retry_after")
+        if self.stage == "code" and self._last_action in ("send_code", "begin_login"):
+            self._resend_until = time.monotonic() + max(1, int(retry_after or 60))
+        if retry_after and "rate limit" in data["message"].lower():
+            self._login_retry_until = time.monotonic() + max(1, int(retry_after))
         self.status.configure(text=data["message"])
         self.selected_key = self.backend.profile_id
         # Widgets stay disabled until the action finishes; clear secrets afterwards.
