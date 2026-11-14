@@ -1,7 +1,9 @@
 """Tk adapter for the authentication service."""
 import webbrowser
+
 import customtkinter as ctk
 from PIL import Image
+
 from telegram_auth import (
     API_SETUP_URL,
     phone_with_country_code,

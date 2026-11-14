@@ -1,4 +1,3 @@
-import asyncio
 import json
 import logging
 import os
@@ -6,10 +5,11 @@ import statistics
 import sys
 import tempfile
 import time
-from types import SimpleNamespace
 from pathlib import Path
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import interactive_downloader as dl
+
 logging.disable(logging.CRITICAL)
 
 def median_ms(fn, times=7):

@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from telethon import types
+
 from engine.demo import DemoClient, DemoService
 from engine.media import category, topic_id
 from telegram_auth import AccountStore

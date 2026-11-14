@@ -651,6 +651,10 @@ main {
 }
 
 .explorer .panel-heading {
+  position: sticky;
+  top: 0;
+  background: var(--surface-panel);
+  z-index: 2;
   padding: 20px 19px 15px;
 }
 
@@ -941,11 +945,18 @@ main {
   white-space: nowrap;
 }
 
+.media-table thead th {
+  position: sticky;
+  top: 0;
+  background: var(--surface-panel);
+  z-index: 2;
+}
+
 .media-table th {
   font-size: 8px;
-  font-weight: 500;
+  font-weight: 600;
   letter-spacing: 1px;
-  color: var(--text-subtle);
+  color: var(--text-muted);
   padding: 15px 0;
   border-bottom: 1px solid var(--line);
 }
@@ -1009,6 +1020,32 @@ main {
 
 .muted-row strong {
   opacity: .65;
+}
+
+[data-theme="dark"] .media-table th {
+  color: #b0bfb8;
+}
+
+[data-theme="dark"] .muted-row strong {
+  color: #a4b5ad;
+  opacity: .85;
+}
+
+[data-theme="dark"] .muted-row td {
+  color: var(--text-muted);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .media-table th {
+    color: #b0bfb8;
+  }
+  :root:not([data-theme="light"]) .muted-row strong {
+    color: #a4b5ad;
+    opacity: .85;
+  }
+  :root:not([data-theme="light"]) .muted-row td {
+    color: var(--text-muted);
+  }
 }
 
 .media-options {

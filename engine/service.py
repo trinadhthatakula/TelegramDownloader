@@ -3,16 +3,17 @@ import asyncio
 import base64
 import json
 import os
+import shutil
 import time
 import uuid
 from dataclasses import asdict
 
-from telethon import errors, types
-from telethon import functions
+from telethon import errors, functions, types
+
 from download_storage import MediaIdentity, get_storage, media_identity
 from engine.catalog import Catalog
-from engine.core import TelegramBackend, ChatPaginationState, DownloadItem
-from engine.media import category, is_forum, CATEGORIES
+from engine.core import ChatPaginationState, DownloadItem, TelegramBackend
+from engine.media import CATEGORIES, category, is_forum
 
 
 class DownloadService(TelegramBackend):
@@ -111,7 +112,7 @@ class DownloadService(TelegramBackend):
             except asyncio.CancelledError:
                 op['status'] = 'cancelled'
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 op['status'], op['message'] = 'failed', str(exc)
                 self.report_error(f'{label}: {exc}')
             finally:
@@ -294,7 +295,7 @@ class DownloadService(TelegramBackend):
             job = await self._disk_operation(self.catalog.create_job, account, req_id, spec, root, selected)
             self.previews[job] = {'account': account, 'generation': generation}
             return {'id': job, 'counts': counts, 'total': len(selected), 'bytes': total_bytes,
-                    'unknown_sizes': unknown, 'output_dir': root,
+                    'free_bytes': shutil.disk_usage(root).free, 'unknown_sizes': unknown, 'output_dir': root,
                     'sample': [{'chat': r['chat_name'], 'topic': r['topic_name'], 'file': r['name']}
                                for r in selected[:8]]}
 

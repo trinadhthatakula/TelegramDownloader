@@ -1,8 +1,14 @@
-import asyncio, json, os, sys, tempfile
-from types import SimpleNamespace
+import asyncio
+import json
+import os
+import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import interactive_downloader as dl
+
 TMP=tempfile.TemporaryDirectory(prefix='tgdl-scheduler-load-')
 dl.CONFIG_FILE=os.path.join(TMP.name,'config.json')
 def msg(i):return SimpleNamespace(id=i,file=SimpleNamespace(ext='.bin',name=f'{i}.bin',size=4))
@@ -47,7 +53,7 @@ def fairness():
             self.started.append(file)
             if len(self.started)==3:self.ready.set()
             await self.release.wait()
-            with open(file,'wb') as f:f.write(b'test')
+            with open(file,'wb') as f:f.write(b'test')  # noqa: ASYNC230
     async def run():
         b.client=C()
         await b.enqueue_selected_chats([chat(1),chat(2)],set(),True)

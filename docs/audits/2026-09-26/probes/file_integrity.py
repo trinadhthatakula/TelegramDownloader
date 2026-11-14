@@ -68,7 +68,7 @@ def main():
             active.file_name = "active.mp4"
             started, release = asyncio.Event(), asyncio.Event()
             async def waiting_transfer(*args, **kwargs):
-                with open(kwargs["file"], "wb") as stream:
+                with open(kwargs["file"], "wb") as stream:  # noqa: ASYNC230
                     stream.write(b"test")
                     stream.flush()
                     started.set()

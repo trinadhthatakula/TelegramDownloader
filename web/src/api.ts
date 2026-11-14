@@ -1,7 +1,7 @@
 export type Scope = { chat_id: number; topic_id?: number | null };
 export type Chat = { id: number; name: string; kind: string; archived: boolean; forum: boolean; topics: { id: number; title: string }[]; scan: { status: string; scanned: number; error: string; updated: number } | null };
 export type QueueItem = { id: string; chat_id: number; chat_name: string; file_name: string; file_size: number | null; status: string; progress: number; downloaded_bytes: number; speed: number; last_error: string | null; output_path: string | null; topic_id: number | null; topic_name: string | null };
-export type Preview = { id: string; counts: Record<string, number>; total: number; bytes: number; unknown_sizes: number; output_dir: string; sample: { chat: string; topic: string | null; file: string }[] };
+export type Preview = { id: string; counts: Record<string, number>; total: number; bytes: number; unknown_sizes: number; output_dir: string; sample: { chat: string; topic: string | null; file: string }[]; free_bytes?: number; };
 export type Operation = { id: string; label: string; status: string; message: string; result: unknown };
 export type State = {
   authorized: boolean; account: string | null; profile_id: string | null;

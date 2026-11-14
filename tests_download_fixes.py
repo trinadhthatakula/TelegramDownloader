@@ -14,8 +14,8 @@ from telethon.sessions import MemorySession
 
 import download_storage as storage
 import interactive_downloader as dl
-from tests_scheduler import SchedulerTests, Client, chat, message
-from tests_storage import WorkerStorageTests, StorageTests, WritingClient, make_item
+from tests_scheduler import Client, SchedulerTests, chat, message
+from tests_storage import StorageTests, WorkerStorageTests, WritingClient, make_item
 
 
 class DownloadFixTests(unittest.TestCase):

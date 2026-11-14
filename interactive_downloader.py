@@ -1,15 +1,15 @@
 import os
 import subprocess
 import sys
-from typing import Tuple
-from dotenv import load_dotenv
-from telegram_auth import AccountStore, validate_credentials
-import customtkinter as ctk
 from tkinter import filedialog, messagebox, ttk
+
+import customtkinter as ctk
+from dotenv import load_dotenv
+
 from engine import core as _core
-from engine.core import *  # noqa: F403 - legacy public API
-from engine.core import _CHAT_KIND_ORDER, _TERMINAL_STATUSES
-from telegram_auth import AccountPage
+from engine.core import *
+from engine.core import _TERMINAL_STATUSES
+from telegram_auth import AccountPage, AccountStore, validate_credentials
 
 
 class TelegramBackend(_core.TelegramBackend):
@@ -116,10 +116,10 @@ class App(ctk.CTk):
                             self.update_single_item_progress(data)
                     else:
                         self._process_ui_update(event_type, data)
-                except Exception as e:
-                    logger.exception("Error handling UI event %r: %s", event_type, e)
-        except Exception as e:
-            logger.exception("Error in UI poll loop: %s", e)
+                except Exception:
+                    logger.exception("Error handling UI event %r", event_type)
+        except Exception:
+            logger.exception("Error in UI poll loop")
         finally:
             self.after(16 if not self.backend.event_queue.empty() else 50, self._poll_queue)
 
@@ -137,8 +137,8 @@ class App(ctk.CTk):
                 self._sidebar_dirty = False
                 self.refresh_group_filter_sidebar()
             self._update_summary()
-        except Exception as e:
-            logger.exception("Error in refresh tick: %s", e)
+        except Exception:
+            logger.exception("Error in refresh tick")
         finally:
             self.after(400, self._tick_refresh)
 
@@ -303,7 +303,7 @@ class App(ctk.CTk):
         async def run():
             try:
                 result = await asyncio.to_thread(fn)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self.backend.emit_event("background_result", (request, None, f"{label}: {exc}"))
             else:
                 self.backend.emit_event("background_result", (request, result, None))
@@ -645,7 +645,7 @@ class App(ctk.CTk):
             return
         total = len(self.filtered_chats)
         if args[0] == "moveto":
-            self.chat_offset = int(round(float(args[1]) * total))
+            self.chat_offset = round(float(args[1]) * total)
         elif args[0] == "scroll":
             step = self.chat_visible_count if len(args) > 2 and args[2] == "pages" else 1
             self.chat_offset += int(args[1]) * step
@@ -972,7 +972,7 @@ class App(ctk.CTk):
         if not args:
             return
         if args[0] == "moveto":
-            self.queue_offset = int(round(float(args[1]) * items_len))
+            self.queue_offset = round(float(args[1]) * items_len)
         elif args[0] == "scroll":
             amount = int(args[1])
             step = self.queue_visible_count if len(args) > 2 and args[2] == "pages" else 1
@@ -1182,7 +1182,7 @@ class App(ctk.CTk):
                 count = await (self.backend.control_all(action) if all_chats
                                else self.backend.control_chat(chat_id, action))
                 self.backend.emit_event("action_finished", f"{action.capitalize()} applied to {scope} ({count} items).")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 self.backend.emit_event("error", f"Could not {action} {scope}: {exc}")
         self.backend.run_coro(run())
 
@@ -1425,7 +1425,7 @@ class App(ctk.CTk):
         finish()
 
 
-def load_credentials() -> Tuple[int, str]:
+def load_credentials() -> tuple[int, str]:
     """Reads Telegram API credentials. Raises ValueError with a user-facing message."""
     load_dotenv(os.path.join(BASE_DIR, ".env"))
     api_id = os.getenv("TG_API_ID")

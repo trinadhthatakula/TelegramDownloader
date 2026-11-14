@@ -1,25 +1,27 @@
-import os
+import asyncio
 import errno
+import json
+import logging
+import os
+import queue
 import re
 import sys
-import json
-import time
-import queue
-import logging
-import asyncio
 import threading
-from logging.handlers import RotatingFileHandler
+import time
 from dataclasses import dataclass
-from typing import Dict, List, Set, Optional, Any
+from logging.handlers import RotatingFileHandler
+from typing import Any
 
 from telethon import TelegramClient, errors
-from telegram_auth import AuthenticationMixin
-from queue_state import CoalescingEventQueue, QueueViewIndex, QueueTotals as QueueStats
+
 import transfer_scheduler as scheduler
+from download_storage import AsyncDiskSink, IncompleteDownloadError, get_storage, media_identity
+from engine.media import is_forum, topic_id, topics_request
+from queue_state import CoalescingEventQueue, QueueViewIndex
+from queue_state import QueueTotals as QueueStats
+from telegram_auth import AuthenticationMixin
+from telegram_transport import ResumeRestartRequired, download_stream
 from transfer_scheduler import TransferSchedulerMixin
-from download_storage import get_storage, media_identity, AsyncDiskSink, IncompleteDownloadError
-from telegram_transport import download_stream, ResumeRestartRequired
-from engine.media import topic_id, is_forum, topics_request
 
 # All app-owned paths resolve against the script directory, never the working
 # directory: launching from elsewhere used to scatter config.json / downloader.log
@@ -93,7 +95,7 @@ def _truncate(name: str) -> str:
     return stem[: MAX_FILENAME_LEN - len(ext)] + ext
 
 
-def sanitize_file_name(raw_name: Optional[str], msg_id: int, ext: str) -> str:
+def sanitize_file_name(raw_name: str | None, msg_id: int, ext: str) -> str:
     """Reduces an uploader-supplied file name to a single safe path component.
 
     msg.file.name is chosen by whoever uploaded the file, so it is hostile input.
@@ -186,12 +188,12 @@ def load_config(config_file=None) -> dict:
                 logger.info("Loaded configuration from %s", CONFIG_FILE)
             else:
                 logger.warning("Ignoring %s: expected a JSON object.", CONFIG_FILE)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning("Failed to load %s: %s", CONFIG_FILE, e)
     return validate_config(data)
 
 
-def save_config(config_data: dict, config_file=None) -> Optional[str]:
+def save_config(config_data: dict, config_file=None) -> str | None:
     """Atomically persists the configuration. Returns an error string on failure."""
     CONFIG_FILE = config_file or globals()["CONFIG_FILE"]
     tmp_path = f"{CONFIG_FILE}.tmp"
@@ -203,7 +205,7 @@ def save_config(config_data: dict, config_file=None) -> Optional[str]:
         os.replace(tmp_path, CONFIG_FILE)
         logger.info("Configuration saved to %s", CONFIG_FILE)
         return None
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.error("Failed to save %s: %s", CONFIG_FILE, e)
         try:
             os.remove(tmp_path)
@@ -212,7 +214,7 @@ def save_config(config_data: dict, config_file=None) -> Optional[str]:
         return str(e)
 
 
-def check_output_dir(path: str) -> Optional[str]:
+def check_output_dir(path: str) -> str | None:
     """Verifies the download directory exists and is writable. Returns an error string."""
     try:
         os.makedirs(path, exist_ok=True)
@@ -232,20 +234,20 @@ class DownloadItem:
     file_name: str
     msg_id: int
     ext: str
-    file_size: Optional[int] = None  # None means Telegram did not report a size
+    file_size: int | None = None  # None means Telegram did not report a size
     status: str = "Queued"
     progress: float = 0.0
     downloaded_bytes: int = 0
     speed: float = 0.0
     retries: int = 0
-    task: Optional[asyncio.Task] = None
+    task: asyncio.Task | None = None
     last_update_time: float = 0.0
     last_bytes: int = 0
-    output_dir: Optional[str] = None
-    topic_id: Optional[int] = None
-    topic_name: Optional[str] = None
-    expected_identity: Optional[str] = None
-    job_id: Optional[str] = None
+    output_dir: str | None = None
+    topic_id: int | None = None
+    topic_name: str | None = None
+    expected_identity: str | None = None
+    job_id: str | None = None
 
 
 # Sort/display order for the chat picker. Groups are what this tool downloads
@@ -304,7 +306,7 @@ class ChatPaginationState:
     last_error: str = ""
     newest_msg_id: int = 0
     stop_msg_id: int = 0
-    output_dir: Optional[str] = None
+    output_dir: str | None = None
 
 
 @dataclass
@@ -334,13 +336,13 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
         self._config_file = config_file
         self.config = load_config(config_file)
 
-        self.client: Optional[TelegramClient] = None
-        self.download_queue: List[DownloadItem] = []
+        self.client: TelegramClient | None = None
+        self.download_queue: list[DownloadItem] = []
         # id -> item, so the per-message duplicate check is O(1) instead of a full
         # scan of download_queue for every message of every batch.
-        self.queue_index: Dict[str, DownloadItem] = {}
-        self.pagination_states: Dict[int, ChatPaginationState] = {}
-        self.chosen_exts: Set[str] = set()
+        self.queue_index: dict[str, DownloadItem] = {}
+        self.pagination_states: dict[int, ChatPaginationState] = {}
+        self.chosen_exts: set[str] = set()
         self.all_formats_mode: bool = False
 
         self.queue_lock = threading.RLock()
@@ -351,13 +353,13 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
         self.latest_scan_generation = 0
         self._extension_scan_task = None
         self._config_save_lock = asyncio.Lock()
-        self.last_dispatched_chat_id: Optional[int] = None
+        self.last_dispatched_chat_id: int | None = None
 
         # Global rate-limit gate. While flood_until is in the future no new
         # download is dispatched, so one FloodWait does not cascade the queue.
         self.flood_until: float = 0.0
         self._flood_timer_armed = False
-        self._pending_tasks: Set[asyncio.Task] = set()
+        self._pending_tasks: set[asyncio.Task] = set()
         self._shutting_down = False
 
         self.loop = asyncio.new_event_loop()
@@ -430,7 +432,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
                 self.loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self.loop.close()
 
-    def _spawn(self, coro, owner: Optional[DownloadItem] = None):
+    def _spawn(self, coro, owner: DownloadItem | None = None):
         """Schedules a coroutine as a real asyncio.Task on the loop thread.
 
         Always producing a Task (rather than a concurrent.futures.Future from
@@ -516,7 +518,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
         finally:
             self._account_resetting = False
 
-    def snapshot_states(self) -> List[ChatSnapshot]:
+    def snapshot_states(self) -> list[ChatSnapshot]:
         """Copies chat progress under lock.
 
         The Tk thread used to iterate pagination_states directly while the loop
@@ -551,7 +553,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
                                           counts.active, counts.failed, state.paused))
         return snapshots
 
-    def snapshot_queue(self, chat_filter: Optional[int] = None) -> List[DownloadItem]:
+    def snapshot_queue(self, chat_filter: int | None = None) -> list[DownloadItem]:
         with self.queue_lock:
             if chat_filter is None:
                 return list(self.download_queue)
@@ -598,8 +600,8 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
         if self.accounts and not self.authorized:
             return
 
-        collected: Dict[int, Any] = {}
-        failures: List[str] = []
+        collected: dict[int, Any] = {}
+        failures: list[str] = []
 
         for label, archived in (("main", False), ("archive", True)):
             try:
@@ -608,7 +610,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
                 await self.session_invalid()
                 return
             except Exception as e:
-                logger.exception("Dialog enumeration failed for the %s folder: %s", label, e)
+                logger.exception("Dialog enumeration failed for the %s folder", label)
                 failures.append(f"{label} folder: {e}")
 
         entries = [ChatEntry.from_dialog(d) for d in collected.values()]
@@ -616,7 +618,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
         # them under hundreds of DMs is indistinguishable from not loading them.
         entries.sort(key=lambda e: (_CHAT_KIND_ORDER.get(e.kind, 9), e.name.lower()))
 
-        counts: Dict[str, int] = {}
+        counts: dict[str, int] = {}
         for e in entries:
             counts[e.kind] = counts.get(e.kind, 0) + 1
         logger.info("Fetched %d dialogs (%s), archived=%d",
@@ -630,7 +632,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
                 "Some chats could not be listed ({}). {} loaded so far — reopen the "
                 "app to try again.".format("; ".join(failures), len(entries)))
 
-    async def _collect_dialogs(self, collected: Dict[int, Any], archived: bool, label: str):
+    async def _collect_dialogs(self, collected: dict[int, Any], archived: bool, label: str):
         """Walks one folder into ``collected``, retrying through rate limits."""
         attempts = 0
         while True:
@@ -728,7 +730,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
                     except (errors.UnauthorizedError, errors.AuthKeyError):
                         await self.session_invalid()
                         return
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001
                         failures.append(f"{dialog.name}: {type(exc).__name__}")
                         break
         except asyncio.CancelledError:
@@ -770,7 +772,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
                 titles.update({topic.id: topic.title for topic in result.topics if hasattr(topic, "title")})
             except (errors.FloodError, errors.UnauthorizedError, errors.AuthKeyError):
                 raise
-            except Exception:
+            except Exception:  # noqa: BLE001
                 logger.info("Topic titles unavailable for chat %s; using stable IDs", chat_id)
             for id in missing:
                 titles.setdefault(id, "General" if id == 1 else f"Topic_{id}")
@@ -821,9 +823,8 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
             if not owns_item() or item.status in ("Cancelled", "Paused"):
                 return
             item.last_error = ""
-            if item.message is None and item.expected_identity:
-                if not await self._refresh_reference(item):
-                    raise ValueError("This message is no longer available. Rescan the chat to refresh it.")
+            if item.message is None and item.expected_identity and not await self._refresh_reference(item):
+                raise ValueError("This message is no longer available. Rescan the chat to refresh it.")
             root, _, _ = await self._disk_operation(self._resolve_paths, item)
             account = (f"user:{self.current_user_id}" if getattr(self, "current_user_id", None)
                        else f"profile:{self.profile_id}" if getattr(self, "profile_id", None)
@@ -903,7 +904,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
             elif owns_item():
                 item.status = "Failed"
                 self.report_error(f"Could not download '{item.file_name}': {e}")
-        except Exception as e:  # noqa: BLE001 - surface unexpected failures without stranding a worker
+        except Exception as e:
             logger.exception("Unexpected failure downloading '%s'", item.file_name)
             if owns_item():
                 item.last_error = str(e)
@@ -1067,7 +1068,7 @@ class TelegramBackend(TransferSchedulerMixin, AuthenticationMixin):
 
         try:
             asyncio.run_coroutine_threadsafe(drain(), self.loop).result(timeout=timeout)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning("Shutdown did not complete cleanly: %s", type(exc).__name__)
         finally:
             self.loop.call_soon_threadsafe(self.loop.stop)

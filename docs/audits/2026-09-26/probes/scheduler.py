@@ -1,6 +1,11 @@
-import asyncio, json, os, sys, tempfile
-from types import SimpleNamespace
+import asyncio
+import json
+import os
+import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import interactive_downloader as dl
 
@@ -18,7 +23,7 @@ class BaseClient:
     async def disconnect(self): pass
     async def download_media(self, message, file, progress_callback=None):
         await asyncio.sleep(0)
-        with open(file,'wb') as f: f.write(b'test')
+        with open(file,'wb') as f: f.write(b'test')  # noqa: ASYNC230
         return file
 
 def test_cursor_loss():
@@ -27,7 +32,7 @@ def test_cursor_loss():
     b._check_and_trigger_next_batch=lambda _:None
     b._arm_fetch_retry=lambda _:None
     class Client(BaseClient):
-        calls=[]
+        calls=[]  # noqa: RUF012
         async def iter_messages(self, entity, limit=None, offset_id=None):
             self.calls.append(offset_id)
             if len(self.calls)==1:

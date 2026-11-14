@@ -2,18 +2,18 @@
 
 Run:  .venv/bin/python tests_ui.py
 """
+import asyncio
 import os
 import sys
-import time
-import asyncio
 import tempfile
+import time
 import traceback
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
 TMP = tempfile.mkdtemp(prefix="tgdl-uitest-")
-import interactive_downloader as dl  # noqa: E402
+import interactive_downloader as dl
 
 dl.CONFIG_FILE = os.path.join(TMP, "config.json")
 dl.LOG_FILE = os.path.join(TMP, "downloader.log")
@@ -389,23 +389,23 @@ def main():
                 if not app.winfo_exists():
                     break
                 pump()
-            except Exception:
+            except Exception:  # noqa: BLE001
                 break
             time.sleep(0.02)
         try:
             destroyed = app.winfo_exists() == 0
-        except Exception:
+        except Exception:  # noqa: BLE001
             destroyed = True  # Tk raises once the interpreter is gone
         check("window destroyed", destroyed)
         check("loop thread stopped", not backend.thread.is_alive())
 
-    except Exception:
+    except Exception:  # noqa: BLE001
         FAIL.append("unhandled")
         traceback.print_exc()
     finally:
         try:
             app.on_close()
-        except Exception:
+        except Exception:  # noqa: BLE001, S110
             pass
         backend.shutdown()
 

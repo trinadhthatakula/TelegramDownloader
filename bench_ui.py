@@ -2,22 +2,22 @@
 
 Run:  .venv/bin/python bench_ui.py
 """
+import asyncio
 import os
 import sys
-import time
-import asyncio
 import tempfile
+import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE)
 
 TMP = tempfile.mkdtemp(prefix="tgdl-bench-")
-import interactive_downloader as dl  # noqa: E402
+import interactive_downloader as dl
 
 dl.CONFIG_FILE = os.path.join(TMP, "config.json")
 dl.LOG_FILE = os.path.join(TMP, "downloader.log")
 
-import customtkinter as ctk  # noqa: E402
+import customtkinter as ctk
 
 SIZES = [50, 500, 1200, 4000, 8900]
 # Building the "before" list is itself the bottleneck being measured, so the

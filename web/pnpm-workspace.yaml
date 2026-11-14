@@ -1,5 +1,12 @@
 packages:
   - .
+
+# Dependency overrides for Vite+ toolchain alignment:
+# - vite@*: npm:@voidzero-dev/vite-plus-core@1.6.0 redirects any package expecting standard Vite
+#   (e.g., @vitejs/plugin-react) to Vite+ Core 1.6.0, ensuring single-instance runtime compatibility
+#   and preventing duplicate or conflicting Vite instances.
+# - vitest@*: 5.1.0 pins the test runner to the exact Vitest version compatible with
+#   vite-plus 1.6.0's embedded `vp test` execution environment.
 overrides:
   vite@*: npm:@voidzero-dev/vite-plus-core@1.6.0
   vitest@*: 5.1.0

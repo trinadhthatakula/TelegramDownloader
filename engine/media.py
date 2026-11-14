@@ -1,5 +1,6 @@
 """Stable classification and forum routing for Telegram media."""
 import mimetypes
+
 from telethon import functions
 
 CATEGORIES = ("images", "videos", "animations", "audio", "voice", "video_messages", "stickers", "documents")

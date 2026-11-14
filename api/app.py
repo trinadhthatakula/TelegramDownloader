@@ -14,7 +14,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -43,6 +43,38 @@ class Control(BaseModel):
 
 def directory_info(path, check=False):
     root = Path(path).expanduser().resolve()
+    sensitive_targets = [
+        Path.home() / '.ssh',
+        Path.home() / '.gnupg',
+    ]
+    if sys.platform == 'win32' or os.name == 'nt':
+        sensitive_targets.append(Path('C:/Windows/System32'))
+        sys_root = os.environ.get('SystemRoot')
+        if sys_root:
+            sensitive_targets.append(Path(sys_root) / 'System32')
+    else:
+        sensitive_targets.extend([
+            Path('/etc'),
+            Path('/var/run'),
+            Path('/proc'),
+            Path('/sys'),
+        ])
+    for target in sensitive_targets:
+        target_exp = target.expanduser()
+        is_restricted = False
+        try:
+            if root.is_relative_to(target_exp):
+                is_restricted = True
+        except (ValueError, TypeError):
+            pass
+        if not is_restricted:
+            try:
+                if root.is_relative_to(target_exp.resolve()):
+                    is_restricted = True
+            except (ValueError, TypeError):
+                pass
+        if is_restricted:
+            raise ValueError('Access to sensitive system directories is restricted.')
     if check:
         root.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryFile(dir=root) as stream:
@@ -122,6 +154,7 @@ def create_app(service: DownloadService, token=None, port=8765, dev_origin=None,
         return response
 
     @app.exception_handler(ValueError)
+    @app.exception_handler(TypeError)
     async def invalid(request, error):
         return JSONResponse({'detail': str(error)}, status_code=400)
 
@@ -248,7 +281,7 @@ def create_app(service: DownloadService, token=None, port=8765, dev_origin=None,
     async def settings(request: Request):
         data = await request.json()
         if not isinstance(data, dict):
-            raise ValueError('Settings must be an object')
+            raise TypeError('Settings must be an object')
         await asyncio.to_thread(directory_info, data.get('output_dir') or service.config['output_dir'], True)
         error = await invoke(service.apply_config(data))
         if error:

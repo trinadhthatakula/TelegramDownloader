@@ -11,9 +11,9 @@ import os
 import shutil
 import sqlite3
 import threading
+import unicodedata
 import uuid
 import weakref
-import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 

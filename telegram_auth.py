@@ -10,7 +10,6 @@ import os
 import re
 import tempfile
 import uuid
-import webbrowser
 from io import BytesIO
 
 from PIL import Image, ImageDraw, ImageOps

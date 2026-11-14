@@ -1,9 +1,10 @@
 """Explicit offline demo transport. Never opens a real Telegram connection."""
 import asyncio
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
-from telethon import types, errors
+from telethon import errors, types
+
 from engine.service import DownloadService
 
 DEMO_NAMES = {1001: 'Animals', 1002: 'Design inspiration', 1003: 'Weekend adventures', 1004: 'Saved recipes', 1005: 'Photography club', 1006: 'Music discoveries', 1007: 'Project archive'}

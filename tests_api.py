@@ -219,6 +219,9 @@ class ApiTests(unittest.TestCase):
         preview_data = op['result']
         self.assertEqual(preview_data['counts'], {'images': 2, 'videos': 1})
         self.assertEqual(preview_data['total'], 3)
+        self.assertIn('free_bytes', preview_data)
+        self.assertIsInstance(preview_data['free_bytes'], int)
+        self.assertGreaterEqual(preview_data['free_bytes'], 0)
 
         # Resume job
         job_id = preview_data['id']
@@ -347,6 +350,44 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(res.status_code, 200)
         self.assertTrue(res.json()['stopped'])
         self.assertTrue(shutdown_called)
+
+    def test_preview_includes_free_bytes(self):
+        self.run_async(self.service.scan([1001]))
+        preview_payload = {
+            'scopes': [{'chat_id': 1001}],
+            'quantities': {'images': 1},
+            'order': 'newest',
+            'skip_existing': True,
+        }
+        preview_data = self.run_async(self.service.preview(preview_payload))
+        self.assertIn('free_bytes', preview_data)
+        self.assertIsInstance(preview_data['free_bytes'], int)
+        self.assertGreaterEqual(preview_data['free_bytes'], 0)
+
+    def test_sensitive_directory_restricted(self):
+        self.client.post(
+            '/api/session',
+            headers={
+                'host': '127.0.0.1:8765',
+                'authorization': f'Bearer {self.launch_token}',
+            },
+        )
+        res = self.client.get(
+            '/api/directories?path=~/.ssh',
+            headers={'host': '127.0.0.1:8765'},
+        )
+        self.assertEqual(res.status_code, 400)
+        self.assertIn('restricted', res.json()['detail'].lower())
+        self.assertEqual(res.json()['detail'], 'Access to sensitive system directories is restricted.')
+
+        # Also verify POST /api/directories/check
+        res_check = self.client.post(
+            '/api/directories/check',
+            json={'path': '~/.ssh'},
+            headers={'host': '127.0.0.1:8765'},
+        )
+        self.assertEqual(res_check.status_code, 400)
+        self.assertEqual(res_check.json()['detail'], 'Access to sensitive system directories is restricted.')
 
 
 if __name__ == '__main__':

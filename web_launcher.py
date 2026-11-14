@@ -6,8 +6,8 @@ import tempfile
 import webbrowser
 from pathlib import Path
 
-from dotenv import load_dotenv
 import uvicorn
+from dotenv import load_dotenv
 
 from api.app import create_app
 from engine.core import BASE_DIR, configure_logging
@@ -41,7 +41,7 @@ def main(argv=None):
         parser.error('port must be between 1024 and 65535')
     directory = Path(tempfile.mkdtemp(prefix='tgdl-demo-')) if args.demo else Path(args.data_dir).expanduser().resolve()
     directory.mkdir(parents=True, exist_ok=True)
-    lock = open(directory / '.web-service.lock', 'a+')
+    lock = open(directory / '.web-service.lock', 'a+')  # noqa: SIM115
     try:
         if os.name == 'nt':
             import msvcrt
