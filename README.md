@@ -133,58 +133,52 @@ legacy session path). These are sensitive local files, **not encrypted**. New
 session directories use owner-only access, and account/session files use owner-only
 permissions on POSIX systems. Login codes and two-step passwords are never saved.
 The credential files are ignored by Git; keep them out of shared backups.
+## Using the Web UI
 
-## Run
+Run the app on your computer (`.venv/bin/tg-download-web` or `.venv/bin/python web_launcher.py`) and it opens in your default browser at `http://127.0.0.1:8765/#token=...`. Everything runs locally on your machine—no cloud servers or third-party proxies are involved.
+
+1. **Library & Chat Explorer**
+   - Browse all dialogs (Groups, Channels, Direct Messages, Bots, and Archived chats).
+   - Forum groups expand to display individual topics (including General).
+   - Run a background inventory scan to discover all accessible media history without freezing the interface.
+   - Quick counters show approximate server counts, while the full scan classifies every item by category with exact size and date.
+
+2. **Quantity Selection & Preview**
+   - Choose exact download quotas (e.g., 50 images and 10 videos) rather than downloading entire channel histories blindly.
+   - Select order (Newest first or Oldest first) and apply optional file extension or date filters.
+   - Parent chats and child topics are automatically normalized to prevent duplicate downloads.
+   - Click **Preview selection** to review candidate files, destination folders, and estimated download sizes before queuing.
+   - Durable jobs are saved to SQLite so your selections survive restarts.
+
+3. **Download Queue**
+   - Live stream tracking shows per-file progress, transfer speed, and completion status.
+   - Scoped controls: pause, resume, cancel, or retry failed items at file, topic, chat, or global scope.
+   - Clear finished items to keep your queue tidy without deleting downloaded files.
+   - Persistent errors appear in the Issues drawer so failures remain actionable.
+
+4. **Settings & Directory Management**
+   - Set the output folder with instant disk write checks and free-space indicators.
+   - Adjust concurrent downloads (1 to 10 parallel file transfers).
+   - Detect and safely clean up unrecognized or abandoned `.part` fragments with confirmation.
+   - One-click button to open your download directory in Finder / File Explorer.
+
+### Legacy Desktop Interface (Tkinter)
+
+The original desktop Tk GUI is still available if preferred:
 
 ```bash
 .venv/bin/python interactive_downloader.py
-# or, after `pip install -e .`
+# or
 .venv/bin/tg-download
 ```
 
-## Using it
+It supports the original chat selection, format scanning, and download controls.
 
-1. **Groups & Formats** — tick the chats you want. Every chat, channel and group
-   is loaded, including archived ones; the type toggles (Group / Channel / DM /
-   Bot) and *Include archived* narrow the list without clearing your selection.
-   Use *Show selected chats only* to review it; clear the search and enable
-   archived chats when reviewing the entire selection. *Select all shown* ticks
-   the current list.
-   Choose **All files**, or choose **Selected formats**, scan the selected chats,
-   and tick at least one extension. Scans show progress and can be cancelled;
-   changing the chat selection invalidates the previous scan. Click
-   **Add to downloads** to create jobs for all selected chats.
-2. **Download Queue** — each row shows its source chat, progress, and file details.
-   Select a chat in the sidebar for its totals and **Pause chat**, **Resume**,
-   **Cancel**, and **Retry failed** actions. The sidebar also has explicit controls
-   for all downloads. Errors remain available in **View issues**; a later progress
-   update does not erase them. Lists adapt their visible rows to the window size
-   and support keyboard navigation.
-3. **Settings** — download folder, parallel downloads (1–10), scan depth
-   (0 = unlimited, for format scanning), and cleanup for unrecognized `.part`
-   files. Folder checks, settings writes, and cleanup run in the background.
+## Security & Local Data Privacy
 
-Multiple chat jobs keep their own format selections. Repeated **Add to downloads**
-does not create overlapping history scans or duplicate queue entries. Cancel a
-running job before adding it with different formats. Discovery uses at most three
-concurrent history requests. At most 50 transfers per chat and 500 globally are
-admitted to run; additional resumed work waits for capacity. File transfers use
-the separate parallel-download setting and share slots across chats. Completed
-history remains visible until **Clear completed** removes it.
-
-Each job keeps the output directory selected when it was added, including through
-retries, pause, and resume. Changing Settings affects newly added jobs without
-moving an existing job's remaining files into a different directory.
-
-**Pause** stops discovery and transfers while retaining progress. **Cancel** also
-stops the selected work; **Resume** can restore paused or cancelled items.
-**Retry failed** retries failed transfers and failed discovery, and
-**Clear completed** removes only completed/skipped rows, preserving failed and
-cancelled work. Stopping a job waits for its old workers before a resume can start.
-
-Telegram rate limits pause discovery and new transfer dispatch until the server's
-deadline. Retries also use backoff. Jobs resume automatically unless you have
-paused or cancelled them; exhausted retries remain visible for manual recovery.
+- **Runs strictly on loopback (`127.0.0.1`):** The local FastAPI service accepts connections only from loopback origins, protects against DNS rebinding, and requires a random launch token to establish an HttpOnly `SameSite=Strict` session cookie.
+- **No cloud telemetry or secrets transmission:** All Telegram API IDs, hashes, and session files reside exclusively on your machine and are never transmitted to external servers.
+- **Never committed to Git:** Credential files (`.env`, `accounts.json`, `*.session*`), local SQLite databases, and temporary partial files are all strictly excluded in `.gitignore`.
 
 ### Existing files, safe names, and resume
 
