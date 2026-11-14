@@ -2,6 +2,8 @@
 
 A bulk downloader for Telegram media with both a modern local Web interface (React + TypeScript + Vite+) and a legacy Tk desktop interface. Pick chats or forum topics, filter by media category or file extension, select specific quantities (e.g. 50 newest images and 10 videos), and stream downloads safely into organized directories with persistent resume, verification, and pause/cancel controls.
 
+![Telegram Downloader Web UI](docs/images/web-ui-library.png)
+
 ## Features
 
 - **Web & Desktop Interfaces:** Modern responsive web UI served locally via FastAPI, plus the classic Tk interface.
@@ -156,11 +158,15 @@ Run the app on your computer (`.venv/bin/tg-download-web` or `.venv/bin/python w
    - Clear finished items to keep your queue tidy without deleting downloaded files.
    - Persistent errors appear in the Issues drawer so failures remain actionable.
 
+   ![Telegram Downloader - Download Queue](docs/images/web-ui-downloads.png)
+
 4. **Settings & Directory Management**
    - Set the output folder with instant disk write checks and free-space indicators.
    - Adjust concurrent downloads (1 to 10 parallel file transfers).
    - Detect and safely clean up unrecognized or abandoned `.part` fragments with confirmation.
    - One-click button to open your download directory in Finder / File Explorer.
+
+   ![Telegram Downloader - Settings](docs/images/web-ui-settings.png)
 
 ### Legacy Desktop Interface (Tkinter)
 
