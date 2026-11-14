@@ -29,3 +29,19 @@ dist/
 # Editors / OS
 .idea/
 .DS_Store
+
+# Web / node / pnpm
+node_modules/
+web/node_modules/
+.pnpm-store/
+.pnpm-debug.log*
+
+# Catalog and web locks
+catalog.sqlite3*
+.web-service.lock
+
+# AI tooling and local configs
+.codex/
+opencode.json
+skills/
+package-lock.json

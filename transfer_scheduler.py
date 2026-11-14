@@ -281,6 +281,9 @@ class TransferSchedulerMixin:
                 close = getattr(iterator, "aclose", None)
                 if close is not None:
                     await close()
+            resolve_topics = getattr(self, "_resolve_item_topics", None)
+            if resolve_topics and new_items:
+                await resolve_topics(chat_id, entity, new_items)
             if (account_generation != self._account_generation or state.generation != generation
                     or not self._job_enabled(state)):
                 return
@@ -426,7 +429,13 @@ class TransferSchedulerMixin:
                 ready_chats = ready_chats[offset:] + ready_chats[:offset]
             selected = next((cid for cid in ready_chats if self._active_counts[cid] < per_chat), None)
             if selected is None:
-                break
+                # Preserve a share for first discovery, then lend unused capacity
+                # once all contenders have supplied (or exhausted) their queues.
+                discovering = set(self._discovery_tasks) | self._discovery_waiting_ids
+                if any(not self._active_counts[cid] and not self._queued_counts[cid]
+                       for cid in discovering):
+                    break
+                selected = min(ready_chats, key=lambda cid: self._active_counts[cid])
             item = None
             bucket = self._ready_by_chat[selected]
             while bucket:

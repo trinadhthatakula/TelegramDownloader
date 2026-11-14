@@ -12,6 +12,8 @@ import shutil
 import sqlite3
 import threading
 import uuid
+import weakref
+import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 
@@ -73,6 +75,7 @@ class DownloadStorage:
         self.root = os.path.realpath(root)
         self.lock = threading.RLock()
         self.active = set()
+        self._media_locks = weakref.WeakValueDictionary()
         os.makedirs(self.root, exist_ok=True)
         self.database = os.path.join(self.root, ".telegram-downloader.sqlite3")
         if os.path.islink(self.database):
@@ -89,6 +92,11 @@ class DownloadStorage:
                     destination TEXT NOT NULL UNIQUE, partial TEXT NOT NULL UNIQUE,
                     expected_size INTEGER, exact_size INTEGER NOT NULL,
                     state TEXT NOT NULL DEFAULT 'partial', size INTEGER, digest TEXT
+                );
+                CREATE TABLE IF NOT EXISTS topics (
+                    account TEXT NOT NULL, chat_id INTEGER NOT NULL, topic_id INTEGER NOT NULL,
+                    directory TEXT NOT NULL UNIQUE,
+                    PRIMARY KEY(account, chat_id, topic_id)
                 );
             """)
 
@@ -126,63 +134,120 @@ class DownloadStorage:
         if row:
             return row["directory"]
         candidate, number = preferred, 1
-        while (db.execute("SELECT 1 FROM chats WHERE directory=?", (candidate,)).fetchone()
+        existing = {self._name_key(r[0]) for r in db.execute("SELECT directory FROM chats")}
+        while (self._name_key(candidate) in existing
                or (os.path.lexists(self._path(candidate)) and not os.path.isdir(self._path(candidate)))):
             number += 1
             candidate = f"{preferred} [{chat_id}]" if number == 2 else f"{preferred} [{chat_id}-{number}]"
         db.execute("INSERT INTO chats VALUES (?, ?, ?)", (account, chat_id, candidate))
         return candidate
 
-    def prepare(self, account, chat_id, preferred_directory, filename, identity):
-        if any(not part or part in (".", "..") or "/" in part or "\\" in part
-               for part in (preferred_directory, filename)):
-            raise ValueError("Download names must be single path components.")
-        with self.lock, self._connect() as db:
-            db.execute("BEGIN IMMEDIATE")
-            directory = self._chat_directory(db, str(account), chat_id, preferred_directory)
-            os.makedirs(self._path(directory), exist_ok=True)
-            row = db.execute("SELECT * FROM media WHERE identity=?", (identity.key,)).fetchone()
-            if row is None:
-                destination = self._free_destination(db, os.path.join(directory, filename))
-                partial = os.path.join(directory, f".tgdl-{identity.key}.part")
-                if os.path.lexists(self._path(partial)):
-                    partial = os.path.join(directory, f".tgdl-{identity.key}-{uuid.uuid4().hex}.part")
-                db.execute("""INSERT INTO media
-                    (identity,metadata,destination,partial,expected_size,exact_size)
-                    VALUES (?,?,?,?,?,?)""", (identity.key, identity.metadata, destination, partial,
-                                               identity.expected_size, int(identity.exact_size)))
+    @staticmethod
+    def _name_key(name):
+        return unicodedata.normalize("NFC", name).casefold()
+
+    def _topic_directory(self, db, account, chat_id, topic_id, parent, preferred):
+        row = db.execute("SELECT directory FROM topics WHERE account=? AND chat_id=? AND topic_id=?",
+                         (account, chat_id, topic_id)).fetchone()
+        if row:
+            return row[0]
+        candidate = os.path.join(parent, preferred)
+        existing = {self._name_key(r[0]) for r in db.execute("SELECT directory FROM topics")}
+        # Reserve a new folder rather than claim unrelated existing user content.
+        number = 1
+        while self._name_key(candidate) in existing or os.path.lexists(self._path(candidate)):
+            number += 1
+            candidate = os.path.join(parent, f"{preferred} [{topic_id}-{number}]")
+        db.execute("INSERT INTO topics VALUES (?,?,?,?)", (account, chat_id, topic_id, candidate))
+        return candidate
+
+    def _media_lock(self, key):
+        with self.lock:
+            lock = self._media_locks.get(key)
+            if lock is None:
+                lock = threading.RLock()
+                self._media_locks[key] = lock
+            return lock
+
+    def verified(self, identity):
+        """Read-only completion check; hashing never holds the shared lock."""
+        with self._media_lock(identity.key):
+            with self._connect() as db:
                 row = db.execute("SELECT * FROM media WHERE identity=?", (identity.key,)).fetchone()
-            elif row["metadata"] != identity.metadata:
-                raise ValueError("The download manifest contains conflicting media metadata.")
-            final, partial = self._path(row["destination"]), self._path(row["partial"])
-            complete = (row["state"] in ("ready", "complete") and row["digest"]
-                        and os.path.isfile(final) and os.path.getsize(final) == row["size"]
-                        and _digest(final) == row["digest"])
-            if complete:
-                db.execute("UPDATE media SET state='complete' WHERE identity=?", (identity.key,))
-                if os.path.isfile(partial) and partial not in self.active:
-                    os.unlink(partial)
-                return Reservation(identity.key, final, partial, identity.expected_size,
-                                   identity.exact_size, True, row["size"])
-            db.execute("UPDATE media SET state='partial',digest=NULL,size=NULL WHERE identity=?",
-                       (identity.key,))
-            if os.path.lexists(final):
-                destination = self._free_destination(db, row["destination"], identity.key)
-                db.execute("UPDATE media SET destination=?,state='partial',digest=NULL,size=NULL WHERE identity=?",
-                           (destination, identity.key))
-                final = self._path(destination)
-            if partial in self.active:
-                raise RuntimeError("This media is already being downloaded.")
-            if os.path.exists(partial) and (not os.path.isfile(partial) or
-                    (identity.exact_size and os.path.getsize(partial) > identity.expected_size)):
-                # Retain inconsistent data for explicit cleanup; never append to it.
-                partial_relative = os.path.join(directory, f".tgdl-{identity.key}-{uuid.uuid4().hex}.part")
-                db.execute("UPDATE media SET partial=?,state='partial' WHERE identity=?",
-                           (partial_relative, identity.key))
-                partial = self._path(partial_relative)
-            db.commit()
-            self.active.add(partial)
-            return Reservation(identity.key, final, partial, identity.expected_size, identity.exact_size)
+            if row is None or row["metadata"] != identity.metadata:
+                return False
+            return self._verified_row(row)
+
+    def _verified_row(self, row):
+        if row["state"] not in ("ready", "complete") or not row["digest"]:
+            return False
+        final = self._path(row["destination"])
+        try:
+            before = os.stat(final)
+            if before.st_size != row["size"] or not os.path.isfile(final):
+                return False
+            digest = _digest(final)
+            after = os.stat(final)
+            return (before.st_ino, before.st_size, before.st_mtime_ns) == (
+                after.st_ino, after.st_size, after.st_mtime_ns) and digest == row["digest"]
+        except FileNotFoundError:
+            return False
+
+    def prepare(self, account, chat_id, preferred_directory, filename, identity,
+                topic_id=None, topic_name=None):
+        if any(not part or part in (".", "..") or "/" in part or "\\" in part
+               for part in (preferred_directory, filename, *([topic_name] if topic_name else []))):
+            raise ValueError("Download names must be single path components.")
+        with self._media_lock(identity.key):
+            with self.lock, self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                directory = self._chat_directory(db, str(account), chat_id, preferred_directory)
+                os.makedirs(self._path(directory), exist_ok=True)
+                if topic_id is not None:
+                    directory = self._topic_directory(db, str(account), chat_id, topic_id, directory,
+                                                      topic_name or f"Topic_{topic_id}")
+                    os.makedirs(self._path(directory), exist_ok=True)
+                row = db.execute("SELECT * FROM media WHERE identity=?", (identity.key,)).fetchone()
+                if row is None:
+                    destination = self._free_destination(db, os.path.join(directory, filename))
+                    partial = os.path.join(directory, f".tgdl-{identity.key}.part")
+                    if os.path.lexists(self._path(partial)):
+                        partial = os.path.join(directory, f".tgdl-{identity.key}-{uuid.uuid4().hex}.part")
+                    db.execute("""INSERT INTO media
+                        (identity,metadata,destination,partial,expected_size,exact_size)
+                        VALUES (?,?,?,?,?,?)""", (identity.key, identity.metadata, destination, partial,
+                                                   identity.expected_size, int(identity.exact_size)))
+                    row = db.execute("SELECT * FROM media WHERE identity=?", (identity.key,)).fetchone()
+                elif row["metadata"] != identity.metadata:
+                    raise ValueError("The download manifest contains conflicting media metadata.")
+                final, partial = self._path(row["destination"]), self._path(row["partial"])
+                if partial in self.active:
+                    raise RuntimeError("This media is already being downloaded.")
+            # The per-media lock protects this identity while other reservations
+            # and completions can proceed during a multi-gigabyte verification.
+            complete = self._verified_row(row)
+            with self.lock, self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                if complete:
+                    db.execute("UPDATE media SET state='complete' WHERE identity=?", (identity.key,))
+                    if os.path.isfile(partial):
+                        os.unlink(partial)
+                    return Reservation(identity.key, final, partial, identity.expected_size,
+                                       identity.exact_size, True, row["size"])
+                db.execute("UPDATE media SET state='partial',digest=NULL,size=NULL WHERE identity=?",
+                           (identity.key,))
+                if os.path.lexists(final):
+                    destination = self._free_destination(db, row["destination"], identity.key)
+                    db.execute("UPDATE media SET destination=? WHERE identity=?", (destination, identity.key))
+                    final = self._path(destination)
+                if os.path.exists(partial) and (not os.path.isfile(partial) or
+                        (identity.exact_size and os.path.getsize(partial) > identity.expected_size)):
+                    relative = os.path.join(directory, f".tgdl-{identity.key}-{uuid.uuid4().hex}.part")
+                    db.execute("UPDATE media SET partial=? WHERE identity=?", (relative, identity.key))
+                    partial = self._path(relative)
+                db.commit()
+                self.active.add(partial)
+                return Reservation(identity.key, final, partial, identity.expected_size, identity.exact_size)
 
     def release(self, reservation):
         with self.lock:
@@ -196,10 +261,11 @@ class DownloadStorage:
             return 0
 
     def finalize(self, reservation):
-        """Validate, persist promotion intent, and atomically create without overwrite."""
-        with self.lock, self._connect() as db:
+        """Validate with per-media ownership; reserve/promote without overwrite."""
+        with self._media_lock(reservation.key):
             partial = self._path(os.path.relpath(reservation.temp_path, self.root))
-            size = os.path.getsize(partial)
+            before = os.stat(partial)
+            size = before.st_size
             if not size:
                 raise IncompleteDownloadError("download produced an empty file")
             if reservation.exact_size and size != reservation.expected_size:
@@ -207,24 +273,30 @@ class DownloadStorage:
             with open(partial, "rb") as stream:
                 os.fsync(stream.fileno())
             digest = _digest(partial)
-            # Commit intent first: a crash immediately after linking is recoverable.
-            db.execute("UPDATE media SET state='ready',size=?,digest=? WHERE identity=?",
-                       (size, digest, reservation.key))
-            db.commit()
+            after = os.stat(partial)
+            if (before.st_ino, before.st_size, before.st_mtime_ns) != (
+                    after.st_ino, after.st_size, after.st_mtime_ns):
+                raise IncompleteDownloadError("partial changed while verifying")
+            with self.lock, self._connect() as db:
+                db.execute("UPDATE media SET state='ready',size=?,digest=? WHERE identity=?",
+                           (size, digest, reservation.key))
             while True:
-                db.execute("BEGIN IMMEDIATE")
-                row = db.execute("SELECT destination FROM media WHERE identity=?", (reservation.key,)).fetchone()
-                destination = self._path(row["destination"])
+                with self.lock, self._connect() as db:
+                    row = db.execute("SELECT destination FROM media WHERE identity=?", (reservation.key,)).fetchone()
+                    destination = self._path(row["destination"])
                 try:
+                    # Copy fallback can be slow on network/FAT volumes. The unique
+                    # manifest reservation and exclusive create protect this path.
                     self._promote_exclusive(partial, destination)
                 except FileExistsError:
-                    relative = self._free_destination(db, row["destination"], reservation.key)
-                    db.execute("UPDATE media SET destination=? WHERE identity=?", (relative, reservation.key))
-                    db.commit()
+                    with self.lock, self._connect() as db:
+                        db.execute("BEGIN IMMEDIATE")
+                        relative = self._free_destination(db, row["destination"], reservation.key)
+                        db.execute("UPDATE media SET destination=? WHERE identity=?", (relative, reservation.key))
                     continue
-                db.execute("UPDATE media SET state='complete' WHERE identity=?", (reservation.key,))
-                db.commit()
-                os.unlink(partial)
+                with self.lock, self._connect() as db:
+                    db.execute("UPDATE media SET state='complete' WHERE identity=?", (reservation.key,))
+                    os.unlink(partial)
                 return destination, size
 
     @staticmethod

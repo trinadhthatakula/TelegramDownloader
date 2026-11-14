@@ -1,17 +1,79 @@
 # Telegram Downloader
 
-A desktop app (customtkinter + Telethon) for bulk-downloading media from Telegram
-chats and channels. Pick chats, optionally filter by file type, and it streams
-files into per-chat folders while showing live per-file progress.
+A bulk downloader for Telegram media with both a modern local Web interface (React + TypeScript + Vite+) and a legacy Tk desktop interface. Pick chats or forum topics, filter by media category or file extension, select specific quantities (e.g. 50 newest images and 10 videos), and stream downloads safely into organized directories with persistent resume, verification, and pause/cancel controls.
+
+## Features
+
+- **Web & Desktop Interfaces:** Modern responsive web UI served locally via FastAPI, plus the classic Tk interface.
+- **Forum Topic Support:** Media is routed into topic-specific folders (e.g., `<output>/animals/dogs/`, `<output>/animals/cats/`, `<output>/animals/General/`).
+- **Complete History Inventory:** Scans accessible cloud history in background batches and classifies items into distinct categories (Images, Videos, Audio, Documents, etc.) with accurate byte and count summaries.
+- **Quantity Selection:** Choose exact amounts (e.g. 50 images, 10 videos) with order options (newest/oldest) and deduplicated parent/topic scopes.
+- **Durable Catalog & Resumable Jobs:** SQLite-backed catalog persists scans, selections, and durable jobs across app restarts.
+- **Safe Storage & Manifest:** Content-addressed file verification with SHA-256 digests; partial `.part` files resume from 512 KiB aligned offsets and never overwrite existing files.
+- **Offline Demo Mode:** Built-in offline demo environment with simulated chats, topics, and downloads for testing without credentials.
 
 ## Setup
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install -e .
+.venv/bin/pip install -e ".[dev]"
 ```
 
-Launch the app and open **Accounts**. No `.env` file or terminal login is required:
+For the web frontend (if building from source):
+
+```bash
+cd web
+pnpm install
+pnpm build
+cd ..
+```
+
+## Running the Application
+
+### 1. Web Application (Recommended)
+
+Run the local web application:
+
+```bash
+.venv/bin/python web_launcher.py
+# or after pip install -e .
+.venv/bin/tg-download-web
+```
+
+This starts the local FastAPI server and opens your browser with a secure, loopback-authenticated URL (`http://127.0.0.1:8765/#token=...`).
+
+#### Offline Demo Mode
+
+To test or inspect the full UI and download workflow offline without a real Telegram account:
+
+```bash
+.venv/bin/python web_launcher.py --demo
+```
+
+#### Frontend Development Mode
+
+To run with Vite live-reload:
+
+```bash
+# Terminal 1: Local API allowing the Vite dev server origin
+.venv/bin/python web_launcher.py --demo --dev --no-browser
+
+# Terminal 2: Vite dev server
+cd web
+pnpm dev
+```
+
+### 2. Desktop Interface (Tkinter)
+
+The legacy desktop interface remains fully functional:
+
+```bash
+.venv/bin/python interactive_downloader.py
+# or
+.venv/bin/tg-download
+```
+
+## Account Setup
 
 1. Click **Open Telegram API setup in browser** to open
    [my.telegram.org/apps](https://my.telegram.org/apps). Sign in there, then open
@@ -164,12 +226,18 @@ No Telegram account or network is needed: suites use fake clients and temporary
 output directories. UI suites require a working desktop/Tk session.
 
 ```bash
-.venv/bin/python -m unittest tests_auth tests_scheduler tests_storage tests_queue_state tests_scan
+# Focused backend & download fix regression suites
+.venv/bin/python -m unittest tests_auth tests_scheduler tests_storage tests_queue_state tests_scan tests_download_fixes.DownloadFixTests
+
+# Catalog, topics, and durable jobs suite
+.venv/bin/python -m unittest tests_catalog
+
+# API endpoints and middleware suite
+.venv/bin/python -m unittest tests_api
+
+# Comprehensive smoke and Tk UI suites
 .venv/bin/python tests_smoke.py
 .venv/bin/python tests_ui.py
-.venv/bin/python -m unittest tests_ui_regressions tests_auth_ui
-.venv/bin/python bench_responsiveness.py
-.venv/bin/python bench_ui.py after
 ```
 
 The focused suites cover authentication, bounded multi-chat scheduling, stop/resume

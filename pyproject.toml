@@ -13,20 +13,40 @@ dependencies = [
     "cryptg>=0.4.0",
     "python-dotenv>=1.0.0",
     "customtkinter>=5.2.0",
-    "Pillow>=9.1.0"
+    "Pillow>=9.1.0",
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn>=0.30.0,<1.0.0",
+    "pydantic>=2.0.0,<3.0.0"
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
     "ruff>=0.5.0",
+    "httpx>=0.27.0,<1.0.0"
 ]
 
 [project.scripts]
-tg-download = "interactive_downloader:main"  # creates a CLI executable on install
+tg-download = "interactive_downloader:main"
+tg-download-web = "web_launcher:main"
 
 [tool.setuptools]
-py-modules = ["interactive_downloader", "telegram_auth", "queue_state", "transfer_scheduler", "download_storage"]
+py-modules = [
+    "interactive_downloader",
+    "telegram_auth",
+    "telegram_auth_ui",
+    "telegram_transport",
+    "queue_state",
+    "transfer_scheduler",
+    "download_storage",
+    "web_launcher"
+]
+
+[tool.setuptools.packages.find]
+include = ["engine*", "api*"]
+
+[tool.setuptools.package-data]
+api = ["static/**"]
 
 [tool.ruff]
 line-length = 110
