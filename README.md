@@ -12,6 +12,7 @@ A bulk downloader for Telegram media with both a modern local Web interface (Rea
 - **Quantity Selection:** Choose exact amounts (e.g. 50 images, 10 videos) with order options (newest/oldest) and deduplicated parent/topic scopes.
 - **Durable Catalog & Resumable Jobs:** SQLite-backed catalog persists scans, selections, and durable jobs across app restarts.
 - **Safe Storage & Manifest:** Content-addressed file verification with SHA-256 digests; partial `.part` files resume from 512 KiB aligned offsets and never overwrite existing files.
+- **Dark Mode Support:** Clean light and dark themes with emerald Telegram accents, instant switching in the topbar and settings, and auto-detection from system preferences.
 - **Offline Demo Mode:** Built-in offline demo environment with simulated chats, topics, and downloads for testing without credentials.
 
 ## Setup
@@ -167,6 +168,13 @@ Run the app on your computer (`.venv/bin/tg-download-web` or `.venv/bin/python w
    - One-click button to open your download directory in Finder / File Explorer.
 
    ![Telegram Downloader - Settings](docs/images/web-ui-settings.png)
+
+5. **Dark Mode & Theming**
+   - Seamlessly toggle between light and dark themes via the topbar Moon/Sun button or from the Settings panel.
+   - Deep dark surfaces with emerald Telegram accents matching modern desktop apps.
+   - Automatically detects your system preference (`prefers-color-scheme`) and persists your choice in local storage.
+
+   ![Telegram Downloader - Dark Mode](docs/images/web-ui-dark.png)
 
 ### Legacy Desktop Interface (Tkinter)
 

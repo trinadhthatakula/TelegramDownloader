@@ -123,6 +123,20 @@ async function main() {
   await page.screenshot({ path: path.join(root, 'docs/images/web-ui-settings.png') });
   console.log('Saved docs/images/web-ui-settings.png');
 
+  // 4. Switch to Dark Mode and capture Media library in dark mode
+  console.log('Switching to Dark Mode and capturing view...');
+  const themeToggle = page.locator('button[aria-label="Switch to dark theme"]');
+  if (await themeToggle.count()) {
+    await themeToggle.click();
+    await page.waitForTimeout(500);
+  }
+  const libraryNav = page.locator('nav button:has-text("Media library")');
+  await libraryNav.click();
+  await page.waitForTimeout(1000);
+
+  await page.screenshot({ path: path.join(root, 'docs/images/web-ui-dark.png') });
+  console.log('Saved docs/images/web-ui-dark.png');
+
   await browser.close();
   server.kill();
   console.log('Screenshots completed successfully!');

@@ -1,6 +1,6 @@
 import { StrictMode, useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { createRoot } from 'react-dom/client';
-import { ArrowDownToLine, ArrowRight, ArrowUpRight, Bell, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Download, File, Folder, FolderOpen, HardDrive, Image, LayoutGrid, LoaderCircle, LogOut, Music2, Pause, Play, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Square, Trash2, Users, Video, X } from 'lucide-react';
+import { ArrowDownToLine, ArrowRight, ArrowUpRight, Bell, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Download, File, Folder, FolderOpen, HardDrive, Image, LayoutGrid, LoaderCircle, LogOut, Moon, Music2, Pause, Play, Plus, RefreshCw, Search, Settings2, ShieldCheck, SlidersHorizontal, Sparkles, Square, Sun, Trash2, Users, Video, X } from 'lucide-react';
 import { api, categories, connectSession, normalizedScopes, size, type State, type Scope, type Preview, type Inventory, type Directory, type Operation } from './api';
 import './style.css';
 
@@ -15,7 +15,19 @@ function Modal({ title, children, close }: { title: string; children: ReactNode;
 }
 
 function App() {
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    const saved = localStorage.getItem('tgdl_theme');
+    if (saved === 'dark' || saved === 'light') return saved;
+    return typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  });
   const [state, setState] = useState<State | null>(null);
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+    localStorage.setItem('tgdl_theme', theme);
+  }, [theme]);
+
+  const toggleTheme = () => setTheme(t => (t === 'dark' ? 'light' : 'dark'));
   const [page, setPage] = useState('library');
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
@@ -136,7 +148,7 @@ function App() {
         <button className="account-chip" onClick={() => setPage('accounts')}><span className="avatar">{state?.profile?.photo ? <img src={state.profile.photo} alt=""/> : (state?.profile?.name?.[0] || 'T')}</span><span><strong>{state?.profile?.name || 'Your workspace'}</strong><small>{state?.authorized ? 'Telegram connected' : 'Connect an account'}</small></span><ChevronRight size={15}/></button></div>
     </aside>
     <main>
-      <header className="topbar"><div className="breadcrumbs">Workspace <ChevronRight size={13}/><strong>{title}</strong></div><div className="top-actions"><span className={'connection ' + (state?.authorized ? 'online' : '')}><i/>{state?.authorized ? 'Connected' : 'Not connected'}</span><IconButton label="View issues" onClick={() => setIssuesOpen(true)}><Bell size={19}/>{!!state?.issues.length && <span className="notification-dot"/>}</IconButton></div></header>
+      <header className="topbar"><div className="breadcrumbs">Workspace <ChevronRight size={13}/><strong>{title}</strong></div><div className="top-actions"><IconButton label={theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'} onClick={toggleTheme}>{theme === 'dark' ? <Sun size={19}/> : <Moon size={19}/>}</IconButton><span className={'connection ' + (state?.authorized ? 'online' : '')}><i/>{state?.authorized ? 'Connected' : 'Not connected'}</span><IconButton label="View issues" onClick={() => setIssuesOpen(true)}><Bell size={19}/>{!!state?.issues.length && <span className="notification-dot"/>}</IconButton></div></header>
       {error && <div role="alert" className="alert error"><span>{error}</span><IconButton label="Dismiss error" onClick={() => setError('')}><X size={17}/></IconButton></div>}
       {notice && <div role="status" className="alert"><span>{notice}</span><IconButton label="Dismiss notice" onClick={() => setNotice('')}><X size={17}/></IconButton></div>}
       {!!state?.flood_seconds && <div className="alert">Telegram asked us to wait {state.flood_seconds}s. Downloads will resume automatically.</div>}
@@ -173,7 +185,7 @@ function App() {
             <Pager offset={offset} total={state?.queue_total || 0} pageSize={40} setOffset={setOffset}/>
           </section><section className="panel saved-jobs"><div className="panel-heading"><div><h2>Saved selections</h2><p>Your choices survive closing the app. Reconnect the same account to resume.</p></div><ShieldCheck size={20}/></div>{state?.jobs.length ? state.jobs.map(job => <div className="saved-job" key={job.id}><span className="file-icon"><Folder size={19}/></span><div><strong>{new Date(job.created * 1000).toLocaleString()}</strong><small>{Object.entries(job.counts).map(([status, count]) => `${count} ${status.toLowerCase()}`).join(' · ') || 'Empty selection'}</small><small>{job.output_dir}</small></div><button className="button secondary small" onClick={() => run(`/jobs/${job.id}/resume`)}><Play size={14}/>Resume</button></div>) : <div className="small-empty">No saved selections yet.</div>}</section></div>}
         {page === 'accounts' && <Accounts state={state!} act={act} run={run} busy={busy || (activeOps.some(o => o.label === 'Account') ? 'Account' : '')}/>}
-        {page === 'settings' && <Settings state={state!} act={act} run={run} setNotice={setNotice} setConfirm={setConfirm}/>}
+        {page === 'settings' && <Settings state={state!} act={act} run={run} setNotice={setNotice} setConfirm={setConfirm} theme={theme} setTheme={setTheme}/>}
       </>}
       {!!activeOps.length && <div className="activity-bar" role="status"><LoaderCircle size={15} className="spin"/>{activeOps.map(o => o.label).join(' · ')}<span>Working in the background</span></div>}
     </main>
@@ -209,12 +221,14 @@ function Accounts({ state, run, busy }: { state: State; act: Act; run: Run; busy
     </>}
   </section><p className="page-footnote"><ShieldCheck size={15}/>Login codes and passwords are never saved. Switching accounts stops current work and preserves saved selections.</p></div>;
 }
-function Settings({ state, act, run, setNotice, setConfirm }: { state: State; act: Act; run: Run; setNotice: (s: string) => void; setConfirm: (v: { title: string; text: string; run: () => Promise<unknown> }) => void }) {
+function Settings({ state, act, run, setNotice, setConfirm, theme, setTheme }: { state: State; act: Act; run: Run; setNotice: (s: string) => void; setConfirm: (v: { title: string; text: string; run: () => Promise<unknown> }) => void; theme: 'light' | 'dark'; setTheme: (t: 'light' | 'dark') => void }) {
   const [root, setRoot] = useState(state.config.output_dir); const [parallel, setParallel] = useState(state.config.max_parallel_files);
   const [directory, setDirectory] = useState<Directory | null>(null); const [info, setInfo] = useState<Directory | null>(null);
   const [parts, setParts] = useState<{ count: number; bytes: number } | null>(null);
   const browse = (path: string) => act('Browse folders', async () => { const value = await api<Directory>('/directories?path=' + encodeURIComponent(path)); setDirectory(value); return value; });
-  return <div className="page-content narrow"><div className="page-heading"><div><div className="eyebrow">MAKE IT YOURS</div><h1>Settings</h1><p>Choose where your files live and how they get there.</p></div></div><section className="panel settings-panel"><div className="setting-heading"><FolderOpen/><div><h2>Download location</h2><p>New jobs use this folder. Existing jobs keep their original destination.</p></div></div><Field label="Download directory"><div className="input-group"><input value={root} onChange={e => setRoot(e.target.value)}/><button className="button secondary" onClick={() => browse(root)}>Browse</button></div></Field><div className="button-group"><button onClick={() => act('Check folder', async () => { const value = await api<Directory>('/directories/check', { path: root }); setInfo(value); return value; })}><ShieldCheck size={15}/>Check folder</button><button onClick={() => run('/directories/open')}><ArrowUpRight size={15}/>Open saved folder</button></div>{info && <div className="alert"><Check size={15}/>{info.writable ? 'Writable' : 'Read only'} · {size(info.free_bytes)} free</div>}
+  return <div className="page-content narrow"><div className="page-heading"><div><div className="eyebrow">MAKE IT YOURS</div><h1>Settings</h1><p>Choose where your files live and how they get there.</p></div></div>
+    <section className="panel settings-panel"><div className="setting-heading">{theme === 'dark' ? <Moon size={22}/> : <Sun size={22}/>}<div><h2>Appearance</h2><p>Choose your workspace theme.</p></div></div><div className="button-group"><button className={theme === 'light' ? 'button' : 'button secondary'} onClick={() => setTheme('light')}><Sun size={15}/>Light theme</button><button className={theme === 'dark' ? 'button' : 'button secondary'} onClick={() => setTheme('dark')}><Moon size={15}/>Dark theme</button></div></section>
+    <section className="panel settings-panel"><div className="setting-heading"><FolderOpen/><div><h2>Download location</h2><p>New jobs use this folder. Existing jobs keep their original destination.</p></div></div><Field label="Download directory"><div className="input-group"><input value={root} onChange={e => setRoot(e.target.value)}/><button className="button secondary" onClick={() => browse(root)}>Browse</button></div></Field><div className="button-group"><button onClick={() => act('Check folder', async () => { const value = await api<Directory>('/directories/check', { path: root }); setInfo(value); return value; })}><ShieldCheck size={15}/>Check folder</button><button onClick={() => run('/directories/open')}><ArrowUpRight size={15}/>Open saved folder</button></div>{info && <div className="alert"><Check size={15}/>{info.writable ? 'Writable' : 'Read only'} · {size(info.free_bytes)} free</div>}
     <div className="account-divider"/><div className="setting-heading"><SlidersHorizontal/><div><h2>Parallel downloads</h2><p>Share transfer capacity across your chats.</p></div><strong className="large-number">{parallel}</strong></div><input aria-label="Parallel downloads" type="range" min="1" max="10" value={parallel} onChange={e => setParallel(Number(e.target.value))}/><div className="range-labels"><span>1 · Gentle</span><span>10 · More concurrent files</span></div><p className="muted">Telegram rate limits pause dispatch automatically. More connections do not always mean faster downloads.</p><button className="button" onClick={() => act('Save settings', async () => { const value = await api('/settings', { output_dir: root, max_parallel_files: parallel, scan_depth: 0 }); setNotice('Settings saved.'); return value; })}><Check size={16}/>Save settings</button></section>
     <section className="panel settings-panel"><div className="setting-heading"><HardDrive/><div><h2>Partial files</h2><p>Recognized fragments are preserved for resume. Clean only unrecognized leftovers.</p></div></div><button className="button secondary" onClick={() => act('Inspect partial files', async () => { const value = await api<{ count: number; bytes: number }>('/partials'); setParts(value); return value; })}>Inspect folder</button>{parts && <div className="cleanup-row"><span>{parts.count} unrecognized files · {size(parts.bytes)}</span><button className="button secondary" disabled={!parts.count} onClick={() => setConfirm({ title: 'Remove unrecognized partial files?', text: `${parts.count} unrecognized partial files are eligible for cleanup. Active and resumable files are protected.`, run: async () => { const result = await api<{ count: number; bytes: number }>('/partials/clean', { confirm: true }); setNotice(`Removed ${result.count} files.`); setParts(null); return result; } })}><Trash2 size={15}/>Clean up</button></div>}</section>
     <section className="panel settings-panel"><h2>Local service</h2><p>Closing a browser tab leaves downloads running. Quit to stop the local service safely.</p><button className="button secondary" onClick={() => setConfirm({ title: 'Quit the downloader?', text: 'Downloads will stop and recognized fragments will be retained. Saved selections can be resumed next time.', run: async () => { const result = await api('/quit', {}); setNotice('The service has stopped. You can close this tab.'); return result; } })}><LogOut size={15}/>Quit service</button></section>
